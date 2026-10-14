@@ -235,6 +235,8 @@ window.__ModuleLoader__.load({
       sDepthElapsed: '耗时',
       sDepthCost: '费用',
       sHistory: '审批历史',
+      showMore: '展开细节（碰什么 / 读写 / 收益 / 分步）',
+      showMoreEn: 'Show details',
       sHistoryHint: '记录每一次审批的决定（谁按了允许、谁按了拒绝）。默认只记命令哈希，不记原文。',
       sHistoryOpen: '查看历史',
       sHistoryEnabled: '记录审批历史',
@@ -492,6 +494,8 @@ window.__ModuleLoader__.load({
       sDepthElapsed: 'Elapsed',
       sDepthCost: 'Cost',
       sHistory: 'Approval history',
+      showMore: 'Show details (touches / read-write / benefit / steps)',
+      showMoreEn: 'Show details',
       sHistoryHint: 'Records the decision on every approval (who allowed, who rejected). Stores command hashes only, never the command text, unless you turn that on below.',
       sHistoryOpen: 'View history',
       sHistoryEnabled: 'Record approval history',
@@ -572,10 +576,47 @@ window.__ModuleLoader__.load({
       return String(template).replace(/\{(\w+)\}/gu, (m, key) => (params && params[key] !== undefined ? String(params[key]) : m))
     }
 
-    /** 单行短文本（给日志用，避免换行污染 jsonl）。 */
+    /** v0.6.2：单行短文本（给日志用，避免换行污染 jsonl）。 */
     function oneLineText(value, max = 200) {
       const text = String(value ?? '').replace(/\s+/gu, ' ').trim()
       return text.length > max ? text.slice(0, max) + '…' : text
+    }
+
+    /**
+     * v0.6.2：把原始命令按命中区间切成高亮片段。
+     *
+     * 关键约束：**原始命令一个字都不删**。只是给危险片段加个视觉落点，
+     * 让读者的眼睛有地方落 —— 而不是从左扫到右去找那几个 token。
+     *
+     * @param {string} command
+     * @param {{start:number,end:number,kind:string}[]} spans
+     */
+    function highlightSpans(command, spans) {
+      const text = String(command ?? '')
+      const list = (Array.isArray(spans) ? spans : [])
+        .filter((s) => s && Number.isInteger(s.start) && Number.isInteger(s.end) && s.end > s.start && s.start >= 0 && s.end <= text.length)
+        .sort((a, b) => a.start - b.start)
+      if (list.length === 0) return text
+
+      // 去重叠：同一起点优先取更长的区间
+      const merged = []
+      for (const s of list) {
+        const prev = merged[merged.length - 1]
+        if (prev && s.start < prev.end) continue
+        merged.push(s)
+      }
+
+      const out = []
+      let cursor = 0
+      for (const s of merged) {
+        if (s.start > cursor) out.push(text.slice(cursor, s.start))
+        out.push(
+          h('mark', { className: 'pap_hot pap_hot_' + String(s.kind || 'x').replace(/[^\w-]/gu, ''), key: s.start + ':' + s.end }, text.slice(s.start, s.end)),
+        )
+        cursor = s.end
+      }
+      if (cursor < text.length) out.push(text.slice(cursor))
+      return out
     }
 
     async function api(path, options = {}) {
@@ -1179,6 +1220,9 @@ window.__ModuleLoader__.load({
       const sections = result && result.sections ? result.sections : null
       const unavailable = result && (result.status === 'unavailable' || result.status === 'needs-confirm')
       const isEmpty = result && result.status === 'empty'
+      // v0.6.2：详情默认展开与否，由风险决定（危险/注意自动展开，安全折叠）
+      const detailOpen = Boolean(sections && (sections.risk === '危险' || sections.risk === '注意'))
+
       const blockTitleText = isEmpty ? tt('emptyCommand') : unavailable ? tt('unavailable') : tt('translationTitle')
       // v0.5.9：翻译不可用时，区块标题和 result.headline 是同一句话，
       // 页面上会出现两遍一模一样的「翻译不可用，请自行判断」。这里按内容去重。
@@ -1234,22 +1278,49 @@ window.__ModuleLoader__.load({
               ),
               !result && phase === 'loading' ? h('div', { className: 'pap_skeleton' }, tt('translating')) : null,
               headlineText ? h('div', { className: 'pap_headline pap_headlineWarn' }, headlineText) : null,
+              // ---- v0.6.2：三行决策 ----
+              // 用户点「允许」时只需要回答一个问题：**这条会不会毁我的东西**。
+              // 所以风险 + 建议 + 意图顶在最上面，其余按风险高低决定展开与否。
+              // 阅读成本与风险成正比：大多数命令是安全的 → 扫一眼就过；
+              // 危险的 → 一定被完整看到。这样「平均更快」与「关键时刻更谨慎」不冲突。
               sections
                 ? h(
-                  'div',
-                  { className: 'pap_grid' },
-                  localizedSections(tt, sections).map(([label, key]) =>
-                    h(SectionRow, {
-                      key,
-                      label,
-                      value: h(
-                        'span',
-                        { className: key === 'risk' ? 'pap_risk ' + (colors.colors ? riskClass(sections.risk) : '') : (key === 'background' ? 'pap_background' : undefined) },
-                        key === 'risk' ? (tt('risk')[sections.risk] || sections.risk) : sections[key],
-                      ),
-                    }),
-                  ),
-                )
+                    'div',
+                    { className: 'pap_verdict' + (sections.risk === '危险' ? ' pap_verdictDanger' : '') },
+                    h(
+                      'div',
+                      { className: 'pap_verdictTop' },
+                      h('span', { className: 'pap_verdictRisk ' + (colors.colors ? riskClass(sections.risk) : 'pap_riskPlain') }, tt('risk')[sections.risk] || sections.risk),
+                      h('span', { className: 'pap_verdictAdvice' }, tt('advice')[sections.advice] || sections.advice),
+                    ),
+                    h('div', { className: 'pap_verdictIntent' }, String(sections.intent || '')),
+                    sections.consequence ? h('div', { className: 'pap_verdictConsequence' }, String(sections.consequence)) : null,
+                  )
+                : null,
+              // ---- 次要信息：按风险决定是否默认展开 ----
+              sections
+                ? h(
+                    'details',
+                    { className: 'pap_more', open: detailOpen },
+                    h('summary', null, `${tt('showMore')}${sections.risk === '安全' ? '' : '（建议展开）'}`),
+                    h(
+                      'div',
+                      { className: 'pap_grid' },
+                      localizedSections(tt, sections)
+                        .filter(([, key]) => key !== 'intent' && key !== 'advice')
+                        .map(([label, key]) =>
+                          h(SectionRow, {
+                            key,
+                            label,
+                            value: h(
+                              'span',
+                              { className: key === 'risk' ? 'pap_risk ' + (colors.colors ? riskClass(sections.risk) : '') : undefined },
+                              key === 'risk' ? (tt('risk')[sections.risk] || sections.risk) : sections[key],
+                            ),
+                          }),
+                        ),
+                    ),
+                  )
                 : null,
               sections && sections.parts && sections.parts.length
                 ? h(
@@ -1286,7 +1357,9 @@ window.__ModuleLoader__.load({
                 'div',
                 { className: 'pap_block' },
                 h('div', { className: 'pap_blockHead' }, h('span', { className: 'pap_blockTitle' }, tt('original'))),
-                h('pre', { className: 'pap_command' }, command),
+                // v0.6.2：原始命令一个字都不隐藏，但把**真正触发风险判定的那几个 token** 高亮出来。
+                // 高亮位置来自 rules.spans（与风险判定同一批正则），不会自相矛盾。
+                h('pre', { className: 'pap_command' }, highlightSpans(command, result?.spans)),
               )
               : null,
 
@@ -3361,6 +3434,25 @@ window.__ModuleLoader__.load({
       '.pap_engine{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}',
       '.pap_cost{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}',
       '.pap_costDim{opacity:.85}',
+      // ---- v0.6.2：三行决策 + 折叠 + 高亮 ----
+      '.pap_verdict{border:1px solid var(--dsw-alias-border-secondary,rgba(127,127,127,.22));border-radius:8px;padding:10px 12px;margin-bottom:10px;background:var(--dsw-alias-bg-secondary,rgba(127,127,127,.05))}',
+      '.pap_verdictDanger{border-color:var(--dsw-alias-state-error-primary,#d92d20);background:rgba(217,45,32,.06)}',
+      '.pap_verdictTop{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:4px}',
+      '.pap_verdictRisk{font-size:15px;font-weight:700;line-height:22px}',
+      '.pap_verdictAdvice{font-size:13px;font-weight:600;line-height:20px;color:var(--dsw-alias-label-secondary)}',
+      '.pap_verdictIntent{font-size:14px;line-height:22px;color:var(--dsw-alias-label-primary);margin-bottom:2px}',
+      '.pap_verdictConsequence{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}',
+      '.pap_more{margin:6px 0 10px}',
+      '.pap_more>summary{cursor:pointer;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary);padding:4px 0;list-style:none}',
+      '.pap_more>summary::-webkit-details-marker{display:none}',
+      '.pap_more>summary::before{content:"▸ ";display:inline-block;transition:transform .12s ease}',
+      '.pap_more[open]>summary::before{content:"▾ "}',
+      '.pap_more>summary:hover{color:var(--dsw-alias-label-primary)}',
+      // 原始命令里的危险片段高亮 —— 原文一字不删，只给视觉落点
+      '.pap_hot{background:rgba(217,45,32,.16);color:inherit;border-radius:3px;padding:0 2px;font-weight:600;box-shadow:inset 0 -1px 0 rgba(217,45,32,.55)}',
+      '.pap_hot_network{background:rgba(192,125,0,.16);box-shadow:inset 0 -1px 0 rgba(192,125,0,.55)}',
+      '.pap_hot_registry{background:rgba(217,45,32,.16);box-shadow:inset 0 -1px 0 rgba(217,45,32,.55)}',
+      '.pap_hot_permission{background:rgba(192,125,0,.16);box-shadow:inset 0 -1px 0 rgba(192,125,0,.55)}',
       // v0.6.0：成本透明行
       '.pap_depth{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:4px;padding-top:4px;border-top:1px dashed var(--dsw-alias-border-secondary,rgba(127,127,127,.22));font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}',
       '.pap_depthLabel{color:var(--dsw-alias-label-secondary)}',

@@ -147,7 +147,9 @@ export function normalizeSections(source) {
     : []
 
   return {
-    // 「意图」段（v0.5.5）：最多 60 个汉字，放最前面
+    // 「意图」段（v0.5.5）：卡片第一行。
+    // v0.6.2：提示词要求 ≤34 字；这里仍留 60 的硬上限做兜底，
+    // 这样旧模型输出或超长文本不会把顶行撑爆。
     intent: clampChars(orFallback(intent, '（无法判断这一步的意图，请看下方原始命令）'), 60),
     touch: orFallback(touch, '未能识别具体对象'),
     mode: MODES.includes(String(mode)) ? String(mode) : '执行',

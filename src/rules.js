@@ -440,28 +440,105 @@ function hits(patterns, text) {
 }
 
 /**
- * 剥掉字符串字面量与注释里的内容（保留长度，便于定位），只留下「真正会被执行的命令」。
+ * 剥掉字符串字面量与注释里的内容。**长度保持不变**（等长空格替换）。
  *
- * v0.5.9 修：网络关键词（curl / wget / 联网下载…）是**日常词汇**，
- * 经常出现在展示文案里。真实误报案例：
+ * 为什么长度要一致：execText 的下标必须和原文对齐，v0.6.2 的「危险片段高亮」
+ * 才不会标错位置。高亮和风险判定必须来自同一次匹配，不能各算各的。
  *
- *     Write-Host "=== curl processes alive? ==="      ← 这是在打印状态
- *     Get-CimInstance Win32_Process | ? Name -like '*curl*'   ← 这是在查下载进程
- *
- * 整段命令其实全是本地操作（复制 D:\Comfy-Desktop 下的目录做备份），
- * 却因为 echo 文案里出现了 "curl" 被判成「会联网下载并可能带入恶意程序」。
- * **把本地备份说成联网下载，会直接把用户吓退** —— 这是误报里危害最大的一类。
- *
- * 只用于 NETWORK（网络类）判定：
- *   · 网络词的误报毫无安全价值，只会制造恐慌；
- *   · 删除/权限/注册表类的关键词误报**故意保留** —— 宁可多warn一次，
- *     也不能漏掉一次真正的删除。在安全类别上「宁可误报」是刻意的取舍。
+ * **只用于 NETWORK（网络类）判定** —— 这是刻意的取舍，别扩大：
+ *   · 网络关键词（curl / 下载 / 联网）是**日常词汇**，经常出现在日志文案里。
+ *     真机误报案例：`Write-Host "=== curl processes alive? ==="`
+ *     其实是在查下载进程，整段命令全是本地操作，却因为文案里有个 "curl"
+ *     被判成「会联网下载、可能带入恶意程序」。网络词误报毫无安全价值，只制造恐慌。
+ *   · 删除 / 权限 / 注册表 / 提权类**故意不剥**：宁可多warn一次，
+ *     也不能漏掉一次真正的删除。在安全类别上「宁可误报」是对的。
  */
 function stripLiterals(text) {
+  const blank = (m) => ' '.repeat(m.length)
   return String(text)
-    .replace(/'(?:[^'\\]|\\.)*'/gu, "''")
-    .replace(/"(?:[^"\\]|\\.)*"/gu, '""')
-    .replace(/#[^\n]*/gu, ' ')
+    .replace(/'(?:[^'\\]|\\.)*'/gu, blank)
+    .replace(/"(?:[^"\\]|\\.)*"/gu, blank)
+    .replace(/#[^\n]*/gu, blank)
+}
+
+/**
+ * v0.6.2：返回每个命中在原文中的**位置区间**，供客户端把危险片段高亮出来。
+ *
+ * 为什么必须高亮而不是只写一句结论：`Remove-Item -Recurse -Force <path>`
+ * 里真正决定后果的是第 3、4 个 token，用户从左扫到右很容易扫过头。
+ * 给出视觉落点，阅读成本立刻下降 —— 而原始命令一个字都不用隐藏。
+ *
+ * @returns {{kind:string,label:string,start:number,end:number}[]}
+ */
+export function hitRanges(patterns, text, kind) {
+  const out = []
+  for (const p of patterns) {
+    const re = p instanceof RegExp ? p : p.re
+    const label = p instanceof RegExp ? String(p) : p.label
+    if (!re) continue
+    try {
+      if (re.global || re.sticky) {
+        const g = new RegExp(re.source, re.flags)
+        let m
+        while ((m = g.exec(text)) !== null) {
+          if (m[0].length === 0) {
+            g.lastIndex += 1
+            continue
+          }
+          out.push({ kind, label, start: m.index, end: m.index + m[0].length })
+          if (out.length >= 60) return out
+        }
+      } else {
+        const m = new RegExp(re.source, re.flags.replace(/[gy]/gu, '')).exec(text)
+        if (m) out.push({ kind, label, start: m.index, end: m.index + m[0].length })
+      }
+    } catch {
+      /* 单个正则出错不影响其它 */
+    }
+  }
+  return out
+}
+
+/**
+ * v0.6.2：折叠重复的路径前缀。
+ *
+ * `D:\Comfy-Desktop\a`、`D:\Comfy-Desktop\b`、`D:\Comfy-Desktop\c`
+ * → `D:\Comfy-Desktop\ 等 3 处`
+ *
+ * 这是**降噪不是隐藏** —— 展开后仍然列出全部完整路径。
+ * 一眼扫过去时不必读三遍同一个前缀。
+ */
+export function condensePaths(paths, max = 4) {
+  const list = (Array.isArray(paths) ? paths : []).map((p) => String(p).trim()).filter((p) => p !== '')
+  if (list.length === 0) return ''
+  if (list.length === 1) return list[0]
+  const unique = [...new Set(list)]
+  if (unique.length === 1) return unique[0]
+
+  // 按分隔符切段，找最长公共前缀段
+  const split = (p) => p.split(/([\\/])/u)
+  const segs = unique.map(split)
+  const first = segs[0]
+  let common = 0
+  for (let i = 0; i < first.length; i += 1) {
+    if (segs.every((s) => s[i] === first[i])) common = i + 1
+    else break
+  }
+  const prefix = first.slice(0, common).join('')
+  // 前缀太短（少于两段）就没有折叠价值
+  if (prefix.replace(/[\\/]/gu, '').length >= 2 && prefix !== unique[0]) {
+    const rest = unique.map((p) => (p.startsWith(prefix) ? p.slice(prefix.length) : null))
+    if (rest.every((r) => r !== null && r.length > 0)) {
+      const shown = rest.slice(0, max)
+      const more = rest.length - shown.length
+      const condensed = `${prefix} 下的 ${rest.length} 处${more > 0 ? `（含 ${more} 处未列出）` : ''}：${shown.join('、')}`
+      const plain = unique.slice(0, max).join('、') + (unique.length > max ? ` 等 ${unique.length} 处` : '')
+      // ★ 折叠的唯一目的是降噪。**折叠后比原样更长就是失败**（比如 `ab\x、ab\y`
+      //   只有 9 字，折叠成「ab\ 下的 2 处：x、y」反而 16 字）。这种情况直接不折叠。
+      return condensed.length < plain.length ? condensed : plain
+    }
+  }
+  return unique.slice(0, max).join('、') + (unique.length > max ? ` 等 ${unique.length} 处` : '')
 }
 
 /**
@@ -620,7 +697,7 @@ export function analyzeCommand(command, options = {}) {
 
   // ---- 碰什么 -----------------------------------------------------------
   const touchParts = []
-  if (paths.length > 0) touchParts.push(paths.slice(0, 4).join('、') + (paths.length > 4 ? ` 等 ${paths.length} 处` : ''))
+  if (paths.length > 0) touchParts.push(condensePaths(paths))
   if (downloads.length > 0) touchParts.push('下载来源：' + downloads.join('、'))
   if (localOnly) touchParts.push('本机服务：' + urls.local.slice(0, 3).join('、'))
   if (touchParts.length === 0) touchParts.push('暂未能自动识别具体路径，请看下方原始命令。')
@@ -668,6 +745,18 @@ export function analyzeCommand(command, options = {}) {
     systemDelete,
     segments,
     touch: touchParts.join('；'),
+    // v0.6.2：把命中位置一并带出去，客户端据此高亮原始命令里的危险片段。
+    // 与风险判定来自同一批正则 —— 不会出现「标红了但没触发」。
+    spans: [
+      ...hitRanges(DESTRUCTIVE, text, 'destructive'),
+      ...hitRanges(custom, text, 'blacklist'),
+      ...hitRanges(REGISTRY, text, 'registry'),
+      ...hitRanges(PERMISSION, text, 'permission'),
+      ...hitRanges(ELEVATE, text, 'elevate'),
+      ...hitRanges(ENCODED, text, 'encoded'),
+      // 网络用 execText（已剥字面量），因为 stripLiterals 等长替换，下标与原文一致
+      ...hitRanges(NETWORK, execText, 'network'),
+    ].slice(0, 60),
   }
 }
 

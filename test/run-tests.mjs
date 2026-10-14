@@ -20,7 +20,7 @@ import { createTranslator } from '../src/translate.js'
 import { createApiHandler, API_PREFIX, API_BASE, routeOf } from '../src/server.js'
 import { apply as applyHost } from '../src/plugin.js'
 import { normalizeSettings } from '../src/config.js'
-import { analyzeCommand, isLocalHost, ruleSummary, extractDeleteTargets } from '../src/rules.js'
+import { analyzeCommand, isLocalHost, ruleSummary, extractDeleteTargets, condensePaths } from '../src/rules.js'
 import { decideDepth, canUpgradeToL2 } from '../src/depth.js'
 import { estimateCost } from '../src/cost.js'
 import { createGrants, workspaceScope } from '../src/grants.js'
@@ -3708,6 +3708,103 @@ group('附加（v0.6.0）：分析深度分层（L1 / L2）')
     const t2 = await env2.translator.translate({ command: 'ls -la', toolName: 'pwsh' })
     check('P32', '显式选 auto 后安全命令走 L1（省钱档仍然有效）', t2.depth === 'l1', `depth=${t2.depth}`)
     env2.cleanup()
+  }
+}
+group('附加（v0.6.2）：可读性 —— 三行决策 / 路径折叠 / 危险片段高亮')
+{
+  /* ---------- 1. 路径公共前缀折叠（降噪，不是隐藏） ---------- */
+  {
+    const three = [
+      'D:\\Comfy-Desktop\\临时仓库',
+      'D:\\Comfy-Desktop\\ComfyUI-Shared\\models\\checkpoints',
+      'D:\\Comfy-Desktop\\ComfyUI-Shared\\models\\loras',
+    ]
+    const c = condensePaths(three)
+    check('Q1', '★ 三个共享前缀的路径折叠成一行', c.includes('Comfy-Desktop') && c.includes('3 处'), c)
+    // 真正的收益是**视觉重复**消失，不是字数变少。
+    // 字符数只降 22%，但 `D:\Comfy-Desktop\` 从出现 3 次变成 1 次 —— 眼睛不用读三遍同一个前缀。
+    const prefixTimes = (s) => (s.match(/D:\\Comfy-Desktop\\/gu) || []).length
+    check(
+      'Q2',
+      '★ 共享前缀只出现一次（原样拼接里出现 3 次）—— 这才是降噪的实质',
+      prefixTimes(three.join('、')) === 3 && prefixTimes(c) === 1 && c.length < three.join('、').length,
+      `原样 ${prefixTimes(three.join('、'))} 次/${three.join('、').length} 字 → 折叠 ${prefixTimes(c)} 次/${c.length} 字`,
+    )
+
+    const one = condensePaths(['C:\\a\\b.txt'])
+    check('Q3', '只有一个路径时不做任何折叠', one === 'C:\\a\\b.txt', one)
+
+    const unrelated = condensePaths(['C:\\aaa\\x', 'D:\\bbb\\y'])
+    check('Q4', '没有公共前缀时原样列出（不硬凑）', unrelated.includes('C:\\aaa\\x') && unrelated.includes('D:\\bbb\\y'), unrelated)
+
+    const shallow = condensePaths(['ab\\x', 'ab\\y'])
+    check('Q5', '★ 折叠后更长时不折叠（折叠的唯一目的是降噪）', shallow === 'ab\\x、ab\\y', shallow)
+
+    const r = analyzeCommand('Get-ChildItem D:\\Comfy-Desktop\\a, D:\\Comfy-Desktop\\b, D:\\Comfy-Desktop\\c')
+    check('Q6', '★ analyzeCommand 的 touch 字段用上了折叠结果', /处/.test(r.touch) || r.touch.includes('Comfy-Desktop'), r.touch)
+  }
+
+  /* ---------- 2. 危险片段高亮：位置必须和风险判定同源 ---------- */
+  {
+    const cmd = 'Remove-Item -Recurse -Force D:\\models\\a'
+    const r = analyzeCommand(cmd)
+    check('Q7', '★ 危险命令产出高亮区间', r.spans.length > 0, `spans=${r.spans.length}`)
+
+    const allValid = r.spans.every((s) => s.start >= 0 && s.end > s.start && s.end <= cmd.length)
+    check('Q8', '★ 所有区间都落在原文范围内（不会越界）', allValid, JSON.stringify(r.spans))
+
+    const covered = r.spans.some((s) => cmd.slice(s.start, s.end).toLowerCase().includes('remove-item'))
+    check('Q9', '★ 高亮确实落在 Remove-Item 这个 token 上', covered, JSON.stringify(r.spans.map((s) => cmd.slice(s.start, s.end))))
+
+    const kindOk = r.spans.every((s) => typeof s.kind === 'string' && s.kind !== '')
+    check('Q10', '每个区间带 kind（客户端据此上不同颜色）', kindOk, JSON.stringify([...new Set(r.spans.map((s) => s.kind))]))
+  }
+
+  /* ---------- 3. 高亮不会把误报带回来（剥字面量仍等长） ---------- */
+  {
+    const echo = 'Write-Host "=== curl processes alive? ==="'
+    const r = analyzeCommand(echo)
+    check('Q11', '★ 只在文案里提到 curl → 不产生高亮（与判定一致）', r.spans.filter((s) => s.kind === 'network').length === 0, JSON.stringify(r.spans))
+
+    const real = 'curl https://example.com/x.zip -o D:/tmp/x.zip'
+    const r2 = analyzeCommand(real)
+    check('Q12', '★ 真下载仍然产生 network 高亮', r2.spans.some((s) => s.kind === 'network'), JSON.stringify(r2.spans))
+
+    // 等长替换：索引必须对齐原文
+    const probe = 'Write-Host "=== curl processes alive? ==="\ncurl https://a.com/b'
+    const rp = analyzeCommand(probe)
+    const net = rp.spans.find((s) => s.kind === 'network')
+    check('Q13', '★ 等长替换保证下标对齐（高亮标的是原文里的真 curl，不是错位）', net != null && probe.slice(net.start, net.end).toLowerCase() === 'curl', net ? probe.slice(net.start, net.end) : 'null')
+  }
+
+  /* ---------- 4. 意图长度：顶行不能被撑爆 ---------- */
+  {
+    const s = normalizeSections({ intent: 'x'.repeat(200), risk: '安全' })
+    check('Q14', '★ 超长意图被硬截断（顶行不会失控）', s.intent.length === 60, `长度=${s.intent.length}`)
+    const src = readFileSync(join(HERE_SRC, 'src', 'prompt.js'), 'utf8')
+    check('Q15', '★ 提示词已把意图上限从 60 收紧到 34', /不超过 34 个汉字/u.test(src), '≤34 字')
+  }
+
+  /* ---------- 5. 客户端：三行决策 + 折叠，且原文一字不删 ---------- */
+  {
+    const srcC = readFileSync(join(HERE_SRC, 'client.js'), 'utf8')
+    check('Q16', '★ 风险 + 建议 + 意图 提到最上方（pap_verdict）', /pap_verdictTop/u.test(srcC) && /pap_verdictIntent/u.test(srcC), '三行决策块')
+    check('Q17', '★ 次要信息放进 <details> 折叠', /h\(\s*'details',\s*\{\s*className: 'pap_more'/u.test(srcC) || /className: 'pap_more'/u.test(srcC), 'pap_more')
+    check('Q18', '★ 危险/注意默认展开细节，安全默认折叠', /detailOpen = Boolean\(sections && \(sections\.risk === '危险' \|\| sections\.risk === '注意'\)\)/u.test(srcC), '按风险决定展开')
+    check('Q19', '★ 原始命令用高亮渲染，但内容仍然是完整 command', /highlightSpans\(command, result\?\.spans\)/u.test(srcC), 'highlightSpans(command, …)')
+
+    const hl = srcC.slice(srcC.indexOf('function highlightSpans'), srcC.indexOf('function highlightSpans') + 1600)
+    check('Q20', '★ 高亮函数不做任何删减（切片原样拼接，cursor 推到底）', /out\.push\(text\.slice\(cursor, s\.start\)\)/u.test(hl) && /out\.push\(text\.slice\(cursor\)\)/u.test(hl), '原文完整保留')
+    check('Q21', '★ 高亮前过滤非法区间（脏数据不会让渲染崩掉）', /Number\.isInteger\(s\.start\)/u.test(hl) && /s\.end <= text\.length/u.test(hl), '区间校验')
+    check('Q22', '★ 重叠区间被跳过，不会出现嵌套 mark', /prev && s\.start < prev\.end\) continue/u.test(hl), '去重叠')
+  }
+
+  /* ---------- 6. 决策信息必须在细节之前（顺序红线） ---------- */
+  {
+    const srcC2 = readFileSync(join(HERE_SRC, 'client.js'), 'utf8')
+    const iVerdict = srcC2.indexOf('className: \'pap_verdict\'')
+    const iMore = srcC2.indexOf('className: \'pap_more\'')
+    check('Q23', '★ 源码顺序：pap_verdict 在 pap_more 之前（三行决策真的在最前）', iVerdict > 0 && iMore > 0 && iVerdict < iMore, `verdict@${iVerdict} more@${iMore}`)
   }
 }
 group('结果汇总')

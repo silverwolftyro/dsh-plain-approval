@@ -515,6 +515,8 @@ export function createTranslator(deps) {
       l1.depth = 'l1'
       l1.depthLabel = DEPTH_LABELS.l1
       l1.depthReason = depthInfo.reason
+      // v0.6.2：命中位置区间，客户端据此高亮原始命令里的危险片段
+      l1.spans = Array.isArray(rules.spans) ? rules.spans : []
       l1.elapsedMs = Date.now() - started
       l1.cost = { tokens: 0, cny: 0, costText: '未调用模型，0 成本' }
       l1.canUpgrade = canUpgradeToL2({ depth: 'l1', settings: s })
@@ -669,6 +671,8 @@ export function createTranslator(deps) {
       canUpgrade: canUpgradeToL2({ depth: depthInfo.depth, settings: s }),
       intent: sections.intent,
       sections,
+      // v0.6.2：命中位置区间，客户端据此高亮原始命令里的危险片段
+      spans: Array.isArray(rules.spans) ? rules.spans : [],
       notes,
       formatWarning,
       cost: cost ? { ...cost, costText: formatCny(cost.cny), dailyText } : null,

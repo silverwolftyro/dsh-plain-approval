@@ -1,7 +1,7 @@
 {
   "name": "dsh-plain-approval",
-  "version": "0.6.1",
-  "description": "说人话 —— 让每一条提权命令，都先说人话。DSH 审批卡片「意图」解释插件。v0.6.0 引入分析深度分层；v0.6.1 把默认改为「一律 L2」——识别正确度是核心诉求，最准的那档作默认，省钱档留给用户自选。",
+  "version": "0.6.3",
+  "description": "说人话 —— 让每一条提权命令，都先说人话。DSH 审批卡片「意图」解释插件。v0.6.2 可读性改造：决策信息三行置顶、次要信息按风险折叠、原始命令里的危险片段高亮（原文一字不删）、路径公共前缀折叠。",
   "type": "module",
   "license": "MIT",
   "author": "dsh-plain-approval contributors",
