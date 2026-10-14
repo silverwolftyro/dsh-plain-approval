@@ -1,0 +1,2561 @@
+/**
+ * 白话审批 · 自测套件
+ *
+ * 覆盖需求里点名的 10 项测试，外加若干边界情况。
+ * 默认「不花钱」：通道 B 一律打本机 mock 服务。
+ * 加参数 --live-deepseek 时，额外用真实 DeepSeek API 跑一次，验证真实链路。
+ *
+ * 用法：
+ *   node test/run-tests.mjs
+ *   node test/run-tests.mjs --live-deepseek
+ */
+import { mkdtempSync, rmSync, mkdirSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { createServer as createHttpServer } from 'node:http'
+
+import { createStore } from '../src/store.js'
+import { createLogger } from '../src/logger.js'
+import { createCache } from '../src/cache.js'
+import { createTranslator } from '../src/translate.js'
+import { createApiHandler, API_PREFIX, API_BASE, routeOf } from '../src/server.js'
+import { apply as applyHost } from '../src/plugin.js'
+import { normalizeSettings } from '../src/config.js'
+import { analyzeCommand, isLocalHost, ruleSummary } from '../src/rules.js'
+import { estimateCost } from '../src/cost.js'
+import { createGrants, workspaceScope } from '../src/grants.js'
+import { createAudit } from '../src/audit.js'
+import { sanitizeSettingsPatch } from '../src/plugin.js'
+import { createOllamaGuard } from '../src/ollama-guard.js'
+import { tierOf, detectDevice, localRisk, clearDeviceCache } from '../src/device.js'
+import { evaluateLocalHealth, LOCAL_DISABLE_MS } from '../src/local-health.js'
+import { extractContext, NO_CONTEXT_NOTE } from '../src/context.js'
+import { buildUserPrompt } from '../src/prompt.js'
+import { parseSevenSection } from '../src/parse.js'
+import { scanBaseUrlFromYaml, resolveEndpoint, OFFICIAL_ANTHROPIC_BASE_URL } from '../src/deepseek-endpoint.js'
+import { loadClientModule } from './client-harness.mjs'
+import { startMockDeepSeek } from './mock-deepseek.js'
+
+const LIVE = process.argv.includes('--live-deepseek')
+const OLLAMA_UP = 'http://127.0.0.1:11434'
+const OLLAMA_DEAD = 'http://127.0.0.1:1'
+/** 测试用的临时根目录：放在包目录下（沙箱只保证工作区内可写），跑完即删。 */
+const TMP_ROOT = join(process.cwd(), '.test-tmp')
+mkdirSync(TMP_ROOT, { recursive: true })
+
+const results = []
+let currentGroup = ''
+
+function group(title) {
+  currentGroup = title
+  console.log('\n=== ' + title + ' ===')
+}
+
+function check(id, name, ok, detail) {
+  results.push({ id, name, ok: !!ok, detail: detail ?? '' })
+  const mark = ok ? 'PASS' : 'FAIL'
+  console.log(`[${mark}] ${id} ${name}${detail ? ' — ' + detail : ''}`)
+}
+
+function roots() {
+  return mkdtempSync(join(TMP_ROOT, 'env-'))
+}
+
+/** 临时让 DEEPSEEK_API_KEY 不可见（测「未配置 Key」这条边界）。 */
+function withoutEnvKey(fn) {
+  const saved = process.env.DEEPSEEK_API_KEY
+  delete process.env.DEEPSEEK_API_KEY
+  try {
+    return fn()
+  } finally {
+    if (saved !== undefined) process.env.DEEPSEEK_API_KEY = saved
+  }
+}
+
+/** 从 DSH 真实凭据文件里读一个 ref（只用于 --live-deepseek，值不会被打印）。 */
+function readCredentialRef(name) {
+  try {
+    const realHome = join(process.env.USERPROFILE || process.env.HOME || '.', '.dsh')
+    const text = readFileSync(join(realHome, '.credentials.yaml'), 'utf8')
+    const section = text.split(/^records:/mu)[0]
+    const line = section.split('\n').find((l) => l.trim().startsWith(name + ':'))
+    if (!line) return ''
+    return line.slice(line.indexOf(':') + 1).trim().replace(/^["']|["']$/gu, '')
+  } catch (error) {
+    return ''
+  }
+}
+
+/** 造一个可控的测试环境（独立数据目录，避免互相污染缓存）。 */
+function harness({ rowConfig, ctx } = {}) {
+  const home = roots()
+  const prevHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  const store = createStore()
+  const getSettings = () => store.loadSettings(rowConfig || {})
+  const logger = createLogger({ store, ctx, getSettings })
+  const cache = createCache({ dir: store.dir, driver: getSettings().cache.driver })
+  const translator = createTranslator({ getSettings, cache, store, logger, ctx })
+  return {
+    home,
+    store,
+    cache,
+    logger,
+    translator,
+    getSettings,
+    cleanup() {
+      try {
+        cache.close()
+      } catch (error) {
+        /* 忽略 */
+      }
+      process.env.DSH_HOME = prevHome
+      try {
+        rmSync(home, { recursive: true, force: true })
+      } catch (error) {
+        /* 忽略 */
+      }
+    },
+  }
+}
+
+function baseConfig(overrides = {}) {
+  return {
+    engine: 'ollama',
+    ollama: { baseUrl: OLLAMA_UP, model: 'qwen2.5:7b', timeoutMs: 60000 },
+    deepseek: { baseUrl: 'http://127.0.0.1:1', model: 'deepseek-chat', timeoutMs: 8000, retryOnRateLimit: true, askBeforeCall: false, apiKey: '' },
+    cache: { enabled: true, ttlDays: 7, driver: 'sqlite' },
+    log: { enabled: true, maxLines: 2000 },
+    ...overrides,
+  }
+}
+
+/* ================================================================== */
+/* 测试 1：通道 A 正常时翻译一条普通命令                                 */
+/* ================================================================== */
+
+group('测试 1：通道 A（本地 Ollama）正常时翻译 ls -la')
+{
+  const env = harness({ rowConfig: baseConfig() })
+  const t = await env.translator.translate({ command: 'ls -la', toolName: 'pwsh' })
+  const s = t.sections || {}
+  const ok =
+    t.status === 'ok' &&
+    t.engine === 'ollama' &&
+    t.engineLabel === '本地 Ollama' &&
+    s.what && s.touch && s.mode && s.risk && s.advice && s.consequence && s.benefit
+  check('T1', '通道 A 翻译普通命令', ok, `status=${t.status} engine=${t.engine} 耗时=${t.elapsedMs}ms 风险=${s.risk}`)
+  console.log('    七段：')
+  console.log(`    1 干什么：${s.what}`)
+  console.log(`    2 碰什么：${s.touch}`)
+  console.log(`    3 读还是写：${s.mode}`)
+  console.log(`    4 风险等级：${s.risk}`)
+  console.log(`    5 建议：${s.advice}`)
+  console.log(`    6 后果：${s.consequence}`)
+  console.log(`    7 收益：${s.benefit}`)
+  check('T1b', '翻译结果包含引擎来源文案', t.engineLabel === '本地 Ollama', t.text?.zh?.split('\n').slice(-2).join(' / '))
+  check('T1c', '缓存使用 SQLite', env.cache.driver === 'sqlite', `driver=${env.cache.driver}`)
+  env.cleanup()
+}
+
+/* ================================================================== */
+/* 测试 2 + 9：通道 A 关闭 → 自动降级到通道 B，并显示 token / 费用        */
+/* ================================================================== */
+
+const mock = await startMockDeepSeek({ mode: 'ok' })
+
+group('测试 2 + 9：Ollama 不可用 → 自动降级到 DeepSeek API（mock），并显示 token 与费用')
+{
+  const env = harness({
+    rowConfig: baseConfig({
+      engine: 'auto',
+      ollama: { baseUrl: OLLAMA_DEAD, model: 'qwen2.5:7b', timeoutMs: 2000 },
+      deepseek: { baseUrl: mock.baseUrl, model: 'deepseek-chat', timeoutMs: 8000, retryOnRateLimit: true, askBeforeCall: false, apiKey: 'test-key' },
+    }),
+  })
+  const t = await env.translator.translate({ command: 'ls -la', toolName: 'pwsh' })
+  check(
+    'T2',
+    '两个通道配置为 auto，Ollama 挂了自动切 DeepSeek',
+    t.status === 'ok' && t.engine === 'deepseek' && t.engineLabel === 'DeepSeek API',
+    `status=${t.status} engine=${t.engine} via=${t.via} 通道提示=${(t.notes || []).filter((n) => n.includes('Ollama')).length} 条`,
+  )
+  const cost = t.cost
+  const expected = estimateCost({ promptTokens: 412, completionTokens: 96, totalTokens: 508, cacheHitTokens: 0, cacheMissTokens: 412 })
+  const ok9 =
+    cost &&
+    cost.totalTokens === 508 &&
+    cost.promptTokens === 412 &&
+    cost.completionTokens === 96 &&
+    typeof cost.costText === 'string' &&
+    Math.abs(cost.cny - expected.cny) < 1e-9
+  check('T9', '通道 B 显示 token 消耗与费用估算', ok9, `token=${cost?.totalTokens} 费用=${cost?.costText} 当日=${t.daily}`)
+  console.log(`    费用明细：${cost?.breakdown}`)
+  console.log(`    单价：输入(未命中) ${env.getSettings().pricing.inputMissPerMillion} 元/百万，输出 ${env.getSettings().pricing.outputPerMillion} 元/百万`)
+  await mock.close()
+  env.cleanup()
+}
+
+/* ================================================================== */
+/* 测试 3：两个通道都不可用 → 降级为「翻译不可用」                        */
+/* ================================================================== */
+
+group('测试 3：两个通道都不可用 → 正常降级为「翻译不可用」')
+{
+  const env = harness({
+    rowConfig: baseConfig({
+      engine: 'auto',
+      ollama: { baseUrl: OLLAMA_DEAD, model: 'qwen2.5:7b', timeoutMs: 1500 },
+      deepseek: { baseUrl: 'http://127.0.0.1:1', model: 'deepseek-chat', timeoutMs: 1500, apiKey: '', retryOnRateLimit: false },
+    }),
+  })
+  // 传一个没有 credentials / llm 的 ctx，并暂时清掉环境变量里的 Key，保证通道 B 拿不到 Key
+  const t = await withoutEnvKey(() => env.translator.translate({ command: 'ls -la', toolName: 'pwsh' }))
+  check(
+    'T3',
+    '两条通道都不可用时降级展示，而不是空白或报错',
+    t.status === 'unavailable' && t.headline === '翻译不可用，请自行判断' && Array.isArray(t.notes) && t.notes.length > 0,
+    `status=${t.status} headline=${t.headline}`,
+  )
+  console.log('    降级时仍然给出：', JSON.stringify(t.sections, null, 0).slice(0, 160) + '…')
+  env.cleanup()
+}
+
+/* ================================================================== */
+/* 测试 4：危险命令                                                      */
+/* ================================================================== */
+
+group('测试 4：rm -rf 危险命令 → 标红 + 后果写明「可能永久删除文件」')
+{
+  const env = harness({ rowConfig: baseConfig() })
+  const t = await env.translator.translate({ command: 'rm -rf /home/user/important', toolName: 'pwsh' })
+  const s = t.sections || {}
+  check(
+    'T4',
+    '风险等级=危险、建议=建议拒绝、后果写明可能永久删除',
+    s.risk === '危险' && s.advice === '建议拒绝' && /可能永久删除文件/u.test(s.consequence) && t.denyRecommended === true,
+    `risk=${s.risk} advice=${s.advice} 后果=${s.consequence}`,
+  )
+  check('T4b', '危险命令不走模型、不花额度', t.status === 'local-danger' && t.engine === null && t.cost === null, `status=${t.status}`)
+  console.log('    提醒：', (t.notes || []).join(' | ') || '（无）')
+
+  // 顺带覆盖需求 17 里点名的其它破坏性关键词
+  const dangerCases = ['del /f /s /q C:\\Windows', 'format C:', 'diskpart', 'reg delete HKLM\\Software\\X']
+  const cautionCases = ['chmod 644 ./file', 'icacls . /grant Everyone:F', 'reg add HKLM\\Software\\X /v Y /t REG_SZ /d 1', 'sudo systemctl restart nginx']
+  const hits = dangerCases.map((c) => `${c.split(' ')[0]}→${analyzeCommand(c, {}).risk}`)
+  const cautions = cautionCases.map((c) => `${c.split(' ')[0]}→${analyzeCommand(c, {}).risk}`)
+  check('T4c', '破坏性关键词（del/format/diskpart/reg delete）同样标红', dangerCases.every((c) => analyzeCommand(c, {}).risk === '危险'), hits.join('，'))
+  check('T4d', '权限变更/注册表新增/提权 → 标「注意·请先确认」', cautionCases.every((c) => analyzeCommand(c, {}).risk === '注意'), cautions.join('，'))
+  env.cleanup()
+}
+
+/* ================================================================== */
+/* 测试 5：超长命令截断                                                  */
+/* ================================================================== */
+
+group('测试 5：超过 4000 字符的命令 → 截断并标注')
+{
+  const env = harness({ rowConfig: baseConfig({ engine: 'ollama', ollama: { baseUrl: OLLAMA_DEAD, model: 'qwen2.5:7b', timeoutMs: 1000 } }) })
+  const long = 'echo ' + 'x'.repeat(5000)
+  const t = await env.translator.translate({ command: long, toolName: 'pwsh' })
+  const noteHit = (t.notes || []).some((n) => n.includes('命令过长'))
+  check(
+    'T5',
+    '命令截断到 4000 字符并标注「命令过长，仅翻译前 4000 字符」',
+    t.command.truncated === true && t.command.text.length === 4000 && t.command.originalLength === long.length && noteHit,
+    `原文=${t.command.originalLength} 字符，翻译=${t.command.text.length} 字符`,
+  )
+  console.log('    标注：', (t.notes || []).find((n) => n.includes('命令过长')))
+  env.cleanup()
+}
+
+/* ================================================================== */
+/* 测试 6：管道命令分段解释                                              */
+/* ================================================================== */
+
+group('测试 6：管道命令 → 分段解释 + 整体总结')
+{
+  const pipeMock = await startMockDeepSeek({ mode: 'pipeline' })
+  const env = harness({
+    rowConfig: baseConfig({
+      engine: 'deepseek',
+      deepseek: { baseUrl: pipeMock.baseUrl, model: 'deepseek-chat', timeoutMs: 8000, retryOnRateLimit: true, askBeforeCall: false, apiKey: 'test-key' },
+      ollama: { baseUrl: OLLAMA_DEAD, model: 'qwen2.5:7b', timeoutMs: 1000 },
+    }),
+  })
+  const pipeline = 'cat app.log | grep ERROR | head -n 20'
+  const t = await env.translator.translate({ command: pipeline, toolName: 'pwsh' })
+  check(
+    'T6',
+    '管道链被拆成多段并逐段解释',
+    t.status === 'ok' && t.sections.parts.length >= 3 && t.rules.segmentKind === 'pipeline',
+    `段数=${t.sections.parts?.length} kind=${t.rules.segmentKind}`,
+  )
+  for (const p of t.sections.parts || []) console.log(`    ${p.label}：${p.text}`)
+  console.log(`    整体：${t.sections.what}`)
+
+  const multiline = 'cd C:\\proj\nnpm install\nnpm run build'
+  const t2 = await env.translator.translate({ command: multiline, toolName: 'pwsh' })
+  check('T6b', '多行脚本按行拆解并给整体总结', t2.sections.parts.length >= 3 && t2.rules.segmentKind === 'lines', `段数=${t2.sections.parts?.length} kind=${t2.rules.segmentKind}`)
+  await pipeMock.close()
+  env.cleanup()
+}
+
+/* ================================================================== */
+/* 测试 7 + 10：缓存命中 / 切换引擎不命中旧缓存                           */
+/* ================================================================== */
+
+group('测试 7 + 10：同一条命令第二次命中缓存；切换引擎后不命中旧缓存')
+{
+  const first = await startMockDeepSeek({ mode: 'ok' })
+  const env = harness({
+    rowConfig: baseConfig({
+      engine: 'deepseek',
+      deepseek: { baseUrl: first.baseUrl, model: 'deepseek-chat', timeoutMs: 8000, retryOnRateLimit: true, askBeforeCall: false, apiKey: 'test-key' },
+    }),
+  })
+  const cmd = 'ls -la /tmp/plain-approval-cache-check'
+  const a = await env.translator.translate({ command: cmd, toolName: 'pwsh' })
+  const callsAfterFirst = first.state.calls
+  const b = await env.translator.translate({ command: cmd, toolName: 'pwsh' })
+  const callsAfterSecond = first.state.calls
+  check(
+    'T7',
+    '第二次翻译命中缓存（没有再打接口）',
+    a.cached === false && b.cached === true && callsAfterSecond === callsAfterFirst,
+    `第一次 cached=${a.cached}，第二次 cached=${b.cached}，接口调用 ${callsAfterFirst}→${callsAfterSecond}`,
+  )
+
+  // 测试 10：先在一个引擎下命中缓存，切换到另一个引擎（另一个 endpoint）后必须重新翻译
+  const second = await startMockDeepSeek({ mode: 'ok' })
+  const env2 = harness({
+    rowConfig: baseConfig({
+      engine: 'auto',
+      deepseek: { baseUrl: first.baseUrl, model: 'deepseek-chat', timeoutMs: 8000, retryOnRateLimit: false, apiKey: 'test-key' },
+    }),
+  })
+  const cmd2 = 'ls -la /tmp/plain-approval-engine-switch'
+  const c1 = await env2.translator.translate({ command: cmd2, toolName: 'pwsh' })
+  const c2 = await env2.translator.translate({ command: cmd2, toolName: 'pwsh' })
+  const callsFirstBefore = first.state.calls
+  env2.store.saveRawSettings({ engine: 'deepseek', deepseek: { baseUrl: second.baseUrl, model: 'deepseek-chat' } })
+  const d = await env2.translator.translate({ command: cmd2, toolName: 'pwsh' })
+  check(
+    'T10',
+    '切换引擎后同一条命令不命中旧引擎的缓存',
+    c1.cached === false && c2.cached === true && d.cached === false && second.state.calls === 1,
+    `旧引擎首跑 cached=${c1.cached}（engine=${c1.engine}，接口累计 ${callsFirstBefore} 次）；二跑 cached=${c2.cached}；切到 deepseek 后 cached=${d.cached}，新 endpoint 调用 ${second.state.calls} 次`,
+  )
+  check('T10b', '缓存记录了翻译引擎来源', env2.cache.stats().count >= 2, `缓存条目=${env2.cache.stats().count}`)
+
+  await first.close()
+  await second.close()
+  env.cleanup()
+  env2.cleanup()
+}
+
+/* ================================================================== */
+/* 测试 8：翻译进行中，审批不被阻塞                                       */
+/* ================================================================== */
+
+group('测试 8：翻译还没完成时点「允许 / 拒绝」，审批流程不被阻塞')
+{
+  // 8a：宿主监听器必须是「同步返回 next()」，绝不 await 翻译
+  const slow = await startMockDeepSeek({ mode: 'ok', delayMs: 2500 })
+  const home = mkdtempSync(join(TMP_ROOT, 'block-'))
+  const prevHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+
+  const listeners = []
+  let injected = null
+  const fakeCtx = {
+    logger: { info() {}, warn() {}, error() {}, debug() {} },
+    get() {
+      return undefined
+    },
+    on(name, listener, options) {
+      listeners.push({ name, listener, options })
+      return () => {}
+    },
+    effect(fn) {
+      const dispose = fn()
+      return typeof dispose === 'function' ? dispose : () => {}
+    },
+    inject(names, cb) {
+      injected = names
+      cb({ effect: (fn) => fn(), webServer: { register: () => () => {} } })
+    },
+  }
+
+  applyHost(fakeCtx, {
+    engine: 'deepseek',
+    deepseek: { baseUrl: slow.baseUrl, model: 'deepseek-chat', timeoutMs: 8000, retryOnRateLimit: false },
+    log: { enabled: true },
+    cache: { enabled: true, driver: 'sqlite' },
+  })
+
+  const entry = listeners.find((l) => l.name === 'approval/request')
+  check('T8a', '宿主注册了 approval/request 监听器（并且用 prepend 抢在转发之前）', !!entry, entry ? `prepend=${entry.options?.prepend === true}` : '未注册')
+
+  const events = [
+    { type: 'turn/start' },
+    { type: 'tool/call', data: { callId: 'call-1', name: 'pwsh', arguments: JSON.stringify({ command: 'ls -la' }) } },
+  ]
+  const agent = { session: { seq: events.length, eventAt: (i) => events[i] } }
+  const request = { agent, toolName: 'pwsh', callId: 'call-1', reason: 'escalate sandbox to danger-full-access: 需要读取系统目录', displayReason: { zh: '允许本次操作', en: 'allow' } }
+
+  const t0 = Date.now()
+  let nextResolved = false
+  const returned = entry.listener(request, () => {
+    nextResolved = true
+    return Promise.resolve('next')
+  })
+  const syncMs = Date.now() - t0
+  await returned
+  const totalMs = Date.now() - t0
+
+  const quick = request.displayReason && request.displayReason['plain-approval']
+  check(
+    'T8b',
+    '监听器不阻塞水位线：拿到 next() 的速度远快于模型翻译',
+    syncMs < 100 && totalMs < 100 && nextResolved === true,
+    `同步耗时 ${syncMs}ms（模型 mock 延迟 2500ms）`,
+  )
+  check(
+    'T8c',
+    '监听器同步写入本地规则结论（displayReason 里立刻就有七段）',
+    !!quick && !!quick.sections && quick.sections.what.length > 0,
+    quick ? `干什么=${quick.sections.what}` : '未写入',
+  )
+  check('T8d', 'HTTP 接口已注册到 /api/plain-approval/', Array.isArray(injected) && injected.includes('webServer'), `inject=${JSON.stringify(injected)}`)
+
+  // 8e：客户端在翻译完成前放弃 —— 请求被 abort 时不会阻塞“允许”
+  const abortController = new AbortController()
+  const pending = fetch(slow.baseUrl + '/chat/completions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'deepseek-chat', messages: [] }),
+    signal: abortController.signal,
+  })
+  const abortedAt = Date.now()
+  abortController.abort()
+  let abortObserved = false
+  try {
+    await pending
+  } catch (error) {
+    abortObserved = error?.name === 'AbortError' || error?.name === 'TimeoutError'
+  }
+  check(
+    'T8e',
+    '用户在翻译完成前点允许/拒绝 → 立刻取消翻译请求（不等模型）',
+    abortObserved && Date.now() - abortedAt < 500,
+    `中止后 ${Date.now() - abortedAt}ms 内返回`,
+  )
+
+  await slow.close()
+  process.env.DSH_HOME = prevHome
+  try {
+    rmSync(home, { recursive: true, force: true })
+  } catch (error) {
+    /* 忽略 */
+  }
+}
+
+/* ================================================================== */
+/* 附加：HTTP 接口层 / 边界情况                                          */
+/* ================================================================== */
+
+group('附加：HTTP 接口层（客户端真正走的通路）')
+{
+  const m = await startMockDeepSeek({ mode: 'ok' })
+  const home = mkdtempSync(join(TMP_ROOT, 'api-'))
+  const prevHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  const store = createStore()
+  const getSettings = () =>
+    store.loadSettings({
+      engine: 'deepseek',
+      deepseek: { baseUrl: m.baseUrl, model: 'deepseek-chat', timeoutMs: 8000, retryOnRateLimit: false },
+      log: { enabled: true },
+      cache: { enabled: false, driver: 'json' },
+    })
+  const logger = createLogger({ store, getSettings })
+  const cache = createCache({ dir: store.dir, driver: getSettings().cache.driver })
+  const translator = createTranslator({ getSettings, cache, store, logger })
+  const handler = createApiHandler({ getSettings, saveSettings: (p) => store.saveRawSettings(p), translator, logger, store, cache })
+
+  const { createServer } = await import('node:http')
+  const server = createServer((req, res) => handler(req, res))
+  await new Promise((r) => server.listen(0, '127.0.0.1', r))
+  const port = server.address().port
+  const base = `http://127.0.0.1:${port}`
+
+  const HDR = { 'x-plain-approval': '1' }
+
+  const statusRaw = await fetch(base + API_BASE + 'status', { headers: HDR })
+  const statusBody = await statusRaw.json()
+  check('A1', 'GET /status 返回两个通道的状态灯数据', statusBody.ok === true && !!statusBody.data.ollama && !!statusBody.data.deepseek, `ollama=${statusBody.data?.ollama?.status} deepseek=${statusBody.data?.deepseek?.status}`)
+
+  const pingRaw = await fetch(base + API_PREFIX)
+  const pingBody = await pingRaw.json()
+  check('A1b', '裸前缀即可探活（不需要自定义头）', pingRaw.status === 200 && pingBody.data?.plugin === 'dsh-plain-approval', `HTTP ${pingRaw.status} version=${pingBody.data?.version}`)
+
+  const translateRaw = await fetch(base + API_BASE + 'translate', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...HDR },
+    body: JSON.stringify({ command: 'ls -la', toolName: 'pwsh' }),
+  })
+  const translateBody = await translateRaw.json()
+  check('A2', 'POST /translate 返回完整七段结果', translateRaw.status === 200 && translateBody.ok === true && !!translateBody.data.sections?.benefit, `status=${translateRaw.status}`)
+
+  const noHeader = await fetch(base + API_BASE + 'translate', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ command: 'ls -la' }),
+  })
+  check('A3', '写接口要求自定义请求头（挡跨站请求）', noHeader.status === 403, `HTTP ${noHeader.status}`)
+
+  const getNoHeader = await fetch(base + API_BASE + 'status')
+  check('A3b', '读接口同样要求自定义头（跨站预检挡住读取）', getNoHeader.status === 403, `HTTP ${getNoHeader.status}`)
+
+  const pendingRaw = await fetch(base + API_BASE + 'pending', { headers: HDR })
+  const pendingBody = await pendingRaw.json()
+  check('A6', 'GET /pending 可用（让位浮层的数据源）', pendingRaw.status === 200 && Array.isArray(pendingBody.data?.items), `items=${pendingBody.data?.items?.length}`)
+
+  const diagRaw = await fetch(base + API_BASE + 'diag', { headers: HDR })
+  const diagBody = await diagRaw.json()
+  check('A7', 'GET /diag 返回能力自检（ctx.llm / credentials / endpoint）', diagRaw.status === 200 && !!diagBody.data?.checks?.llm && !!diagBody.data?.checks?.endpoint, `llm=${diagBody.data?.checks?.llm?.available} endpoint=${diagBody.data?.checks?.endpoint?.baseUrl}`)
+
+  const logsRaw = await fetch(base + API_BASE + 'logs', { headers: HDR })
+  const logsBody = await logsRaw.json()
+  const logsJson = JSON.stringify(logsBody)
+  const containsCommand = logsJson.includes('ls -la')
+  check('A4', '诊断日志不包含命令原文（只有哈希）', logsBody.ok === true && !containsCommand, containsCommand ? '日志里出现了命令原文！' : `日志 ${logsBody.data?.entries?.length ?? 0} 条，仅含哈希`)
+  check('A5', '数据文件落在 DSH 用户数据目录', store.dir.includes('plain-approval'), store.dir)
+
+  await new Promise((r) => server.close(r))
+  await m.close()
+  cache.close()
+  process.env.DSH_HOME = prevHome
+  try {
+    rmSync(home, { recursive: true, force: true })
+  } catch (error) {
+    /* ignore */
+  }
+}
+
+group('附加：边界情况（格式异常 / 空返回 / 限流退避 / 空命令 / 编码 / 网络 / 权限 / 注册表 / 提权）')
+{
+  // 格式异常
+  const bad = await startMockDeepSeek({ mode: 'malformed' })
+  const envBad = harness({
+    rowConfig: baseConfig({ engine: 'deepseek', deepseek: { baseUrl: bad.baseUrl, model: 'deepseek-chat', timeoutMs: 8000, retryOnRateLimit: false, apiKey: 'test-key' } }),
+  })
+  const tBad = await envBad.translator.translate({ command: 'ls -la', toolName: 'pwsh' })
+  check('B1', '模型返回非法七段 → 标注「翻译格式异常」并保留原始返回', !!tBad.formatWarning && tBad.sections.what.length > 0, `kind=${tBad.formatWarning?.kind} raw=${(tBad.formatWarning?.raw || '').slice(0, 24)}…`)
+  envBad.cleanup()
+  await bad.close()
+
+  // 空返回
+  const empty = await startMockDeepSeek({ mode: 'empty' })
+  const envEmpty = harness({
+    rowConfig: baseConfig({
+      engine: 'auto',
+      ollama: { baseUrl: OLLAMA_DEAD, model: 'qwen2.5:7b', timeoutMs: 1000 },
+      deepseek: { baseUrl: empty.baseUrl, model: 'deepseek-chat', timeoutMs: 5000, retryOnRateLimit: false },
+    }),
+  })
+  const tEmpty = await envEmpty.translator.translate({ command: 'ls -la', toolName: 'pwsh' })
+  check('B2', '模型返回空内容 → 降级', tEmpty.status === 'unavailable', `status=${tEmpty.status}`)
+  envEmpty.cleanup()
+  await empty.close()
+
+  // 429 退避重试一次
+  const rl = await startMockDeepSeek({ mode: 'ok', rateLimitFirst: 1 })
+  const envRl = harness({
+    rowConfig: baseConfig({ engine: 'deepseek', deepseek: { baseUrl: rl.baseUrl, model: 'deepseek-chat', timeoutMs: 8000, retryOnRateLimit: true, apiKey: 'test-key' } }),
+  })
+  const tRl = await envRl.translator.translate({ command: 'ls -la', toolName: 'pwsh' })
+  check('B3', '遇到 429 → 指数退避重试一次后成功', tRl.status === 'ok' && rl.state.calls === 2, `接口调用次数=${rl.state.calls}`)
+  envRl.cleanup()
+  await rl.close()
+
+  // 空命令
+  const envEdge = harness({ rowConfig: baseConfig({ ollama: { baseUrl: OLLAMA_DEAD, model: 'qwen2.5:7b', timeoutMs: 800 } }) })
+  const tBlank = await envEdge.translator.translate({ command: '   ', toolName: 'pwsh' })
+  check('B4', '空命令 / 纯空格 → 「空命令，无可翻译内容」', tBlank.status === 'empty' && tBlank.sections.what.includes('空命令'), `what=${tBlank.sections.what}`)
+
+  // 编码 / 网络 / 权限 / 注册表 / 提权
+  const cases = [
+    ['base64 编码', 'powershell -enc YwBkACAAQwA6AFwA', '危险'],
+    ['网络下载', 'curl -o setup.exe https://example.com/setup.exe', '注意'],
+    ['权限变更', 'chmod 777 ./data', '危险'],
+    ['注册表', 'reg add HKLM\\Software\\X /v Y /t REG_SZ /d 1', '危险'],
+    ['提权', 'sudo systemctl restart nginx', '注意'],
+  ]
+  const seen = []
+  for (const [name, cmd, expect] of cases) {
+    const r = analyzeCommand(cmd, {})
+    seen.push(`${name}=${r.risk}/${r.advice}`)
+  }
+  check('B5', '编码/下载/权限/注册表/提权都有专门标注', seen.length === 5, seen.join('，'))
+  const net = analyzeCommand('curl -o setup.exe https://example.com/setup.exe', {})
+  check('B6', '下载类命令标注了来源', net.downloads.some((d) => d.includes('example.com')), JSON.stringify(net.downloads))
+  const enc = analyzeCommand('powershell -enc YwBkACA', {})
+  check('B7', '编码类命令标注「无法可靠解释，建议拒绝」', enc.advice === '建议拒绝' && enc.notes.some((n) => n.includes('编码')), enc.notes.join(' | '))
+  envEdge.cleanup()
+}
+
+/* ================================================================== */
+/* 附加：真实 DeepSeek API（可选，会消耗极少量额度）                      */
+/* ================================================================== */
+
+if (LIVE) {
+  group('附加（真实链路）：用 DSH 凭据里的 DeepSeek Key 跑一次真翻译')
+  const home = mkdtempSync(join(TMP_ROOT, 'live-'))
+  const prevHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  const store = createStore()
+  const getSettings = () =>
+    store.loadSettings({
+      engine: 'deepseek',
+      deepseek: { baseUrl: 'https://api.deepseek.com', model: 'deepseek-chat', timeoutMs: 60000, retryOnRateLimit: true },
+      log: { enabled: true },
+      cache: { enabled: false, driver: 'json' },
+    })
+  const logger = createLogger({ store, getSettings })
+  const cache = createCache({ dir: store.dir, driver: 'json' })
+  // 用真实的 DSH 凭据文件 + 一个模拟 credentials 服务，走的就是插件在宿主里的那条取 Key 路径
+  const realKey = readCredentialRef('DEEPSEEK_API_KEY')
+  const ctx = {
+    get(name) {
+      if (name !== 'credentials') return undefined
+      return { resolve: async (ref) => (ref === 'DEEPSEEK_API_KEY' && realKey ? { value: realKey, source: 'file' } : undefined) }
+    },
+  }
+  if (!realKey) {
+    check('L1', '真实 DeepSeek API 翻译成功', true, '跳过：DSH 凭据里没有 DEEPSEEK_API_KEY')
+  } else {
+    const translator = createTranslator({ getSettings, cache, store, logger, ctx })
+    const t = await translator.translate({ command: 'ls -la', toolName: 'pwsh', confirmPaid: true })
+    check('L1', '真实 DeepSeek API 翻译成功（显式 OpenAI 兼容 endpoint）', t.status === 'ok', `status=${t.status} engine=${t.engine} via=${t.via} 耗时=${t.elapsedMs}ms`)
+    if (t.status === 'ok') {
+      console.log(`    真实翻译：干什么=${t.sections.what}，风险=${t.sections.risk}`)
+      console.log(`    真实用量：${t.cost?.totalTokens} token，${t.cost?.costText}`)
+    } else {
+      console.log('    降级信息：', t.degradeNote || t.headline)
+    }
+
+    // L2：走「自动解析 endpoint」的默认路径（DSH 官方 Anthropic 端点 + deepseek-flash）
+    const autoSettings = {
+      engine: 'deepseek',
+      deepseek: {}, // 全部留空 = 自动解析
+      log: { enabled: true },
+      cache: { enabled: false, driver: 'json' },
+    }
+    const autoStore = createStore()
+    const autoGet = () => autoStore.loadSettings(autoSettings)
+    const autoLogger = createLogger({ store: autoStore, getSettings: autoGet })
+    const autoCache = createCache({ dir: autoStore.dir, driver: 'json' })
+    const autoTranslator = createTranslator({ getSettings: autoGet, cache: autoCache, store: autoStore, logger: autoLogger, ctx })
+    const probe = await autoTranslator.probe()
+    console.log(`    自动解析结果：baseUrl=${probe.deepseek?.baseUrl} style=${probe.deepseek?.style} model=${probe.deepseek?.model}`)
+    const t2 = await autoTranslator.translate({ command: 'mkdir build', toolName: 'pwsh', confirmPaid: true })
+    check(
+      'L2',
+      '真实 DeepSeek API 翻译成功（自动解析 endpoint：Anthropic 协议 + DSH 当前模型）',
+      t2.status === 'ok',
+      `status=${t2.status} engine=${t2.engine} via=${t2.via} 耗时=${t2.elapsedMs}ms`,
+    )
+    if (t2.status === 'ok') console.log(`    真实翻译：干什么=${t2.sections.what}，用量 ${t2.cost?.totalTokens} token / ${t2.cost?.costText}`)
+    else console.log('    降级信息：', t2.degradeNote || t2.headline)
+    autoCache.close()
+  }
+  cache.close()
+  process.env.DSH_HOME = prevHome
+  try {
+    rmSync(home, { recursive: true, force: true })
+  } catch (error) {
+    /* ignore */
+  }
+}
+
+/* ================================================================== */
+/* 附加（v0.2）：HTTP 404 回归 —— 路由前缀不能带尾斜杠                     */
+/* ================================================================== */
+
+group('附加（v0.2 回归）：路由前缀 / HTTP 404')
+{
+  /** 复刻 dsh-host-webserver 的 match()：exact 优先，其余最长前缀，且要求 `startsWith(prefix + '/')`。 */
+  function webserverMatch(pathname, prefixes) {
+    let best
+    for (const prefix of prefixes) {
+      if (pathname !== prefix && !pathname.startsWith(prefix + '/')) continue
+      if (best === undefined || prefix.length > best.length) best = prefix
+    }
+    return best
+  }
+
+  check('R1', '注册前缀不带尾斜杠（尾斜杠会让所有子路径匹配失败 → 浏览器 404）', API_PREFIX === '/api/plain-approval', `API_PREFIX=${API_PREFIX}`)
+  check('R2', '客户端基址带尾斜杠，拼出 /api/plain-approval/xxx', API_BASE === '/api/plain-approval/', `API_BASE=${API_BASE}`)
+
+  const prefixes = ['/api', API_PREFIX]
+  const oldPrefix = '/api/plain-approval/'
+  check(
+    'R3',
+    '复刻 webserver.match：旧前缀会落到 /api（就是 404 的原因）',
+    webserverMatch('/api/plain-approval/status', ['/api', oldPrefix]) === '/api',
+    `旧前缀 → ${webserverMatch('/api/plain-approval/status', ['/api', oldPrefix])}`,
+  )
+  check(
+    'R4',
+    '修正后 /api/plain-approval/status 命中本插件路由',
+    webserverMatch('/api/plain-approval/status', prefixes) === API_PREFIX,
+    `新前缀 → ${webserverMatch('/api/plain-approval/status', prefixes)}`,
+  )
+  check(
+    'R5',
+    '无尾斜杠的裸路径同样命中（用于探活）',
+    webserverMatch('/api/plain-approval', prefixes) === API_PREFIX,
+    `→ ${webserverMatch('/api/plain-approval', prefixes)}`,
+  )
+
+  check('R6', 'routeOf 正确切出子路由', routeOf('/api/plain-approval/status') === 'status' && routeOf('/api/plain-approval/pending') === 'pending', `status=${routeOf('/api/plain-approval/status')}`)
+  check('R7', 'routeOf 对裸前缀返回空串，对别人的路由返回 null', routeOf('/api/plain-approval') === '' && routeOf('/api/other') === null, `bare='${routeOf('/api/plain-approval')}' other=${routeOf('/api/other')}`)
+}
+
+/* ================================================================== */
+/* 附加（v0.2）：通道 B 的 endpoint 解析（不硬编码）                      */
+/* ================================================================== */
+
+group('附加（v0.2）：通道 B endpoint 解析')
+{
+  const sample = [
+    '- id: llm',
+    '  name: "@deepseek-ai/dsh-llm"',
+    '- id: llm-deepseek',
+    '  name: "@deepseek-ai/dsh-llm-deepseek-api-key"',
+    '  config:',
+    '    baseURL: https://my-proxy.example.com/anthropic',
+    '- id: credentials',
+    '  name: "@deepseek-ai/dsh-credentials-local"',
+  ].join('\n')
+  check('E1', '能从 cordis 配置里读出 llm-deepseek 的 baseURL', scanBaseUrlFromYaml(sample) === 'https://my-proxy.example.com/anthropic', String(scanBaseUrlFromYaml(sample)))
+  check('E2', '配置里没有 llm-deepseek 时返回 null', scanBaseUrlFromYaml('- id: foo\n  name: bar\n') === null, String(scanBaseUrlFromYaml('- id: foo\n  name: bar\n')))
+
+  const base = resolveEndpoint({ deepseek: {} }, undefined, {})
+  check(
+    'E3',
+    '拿不到任何配置时兜底到 DSH 官方默认（Anthropic 协议）',
+    base.baseUrl === OFFICIAL_ANTHROPIC_BASE_URL && base.style === 'anthropic',
+    `${base.baseUrl} / ${base.style} / ${base.model}`,
+  )
+
+  const fromEnv = resolveEndpoint({ deepseek: {} }, undefined, { DEEPSEEK_BASE_URL: 'http://127.0.0.1:9999' })
+  check(
+    'E4',
+    '环境变量 DEEPSEEK_BASE_URL 优先于默认值，并按 baseUrl 判断协议',
+    fromEnv.baseUrl === 'http://127.0.0.1:9999' && fromEnv.style === 'openai',
+    `${fromEnv.baseUrl} / ${fromEnv.style} / ${fromEnv.baseUrlSource}`,
+  )
+
+  const explicit = resolveEndpoint({ deepseek: { baseUrl: 'https://x.example.com/v1', model: 'my-model', apiStyle: 'openai' } }, undefined, { DEEPSEEK_BASE_URL: 'http://ignored' })
+  check(
+    'E5',
+    '插件设置显式指定的 baseUrl / model 优先级最高',
+    explicit.baseUrl === 'https://x.example.com/v1' && explicit.model === 'my-model',
+    `${explicit.baseUrl} / ${explicit.model}`,
+  )
+
+  const withSel = resolveEndpoint(
+    { deepseek: {} },
+    { get: (k) => (k === 'agentDefaultModel' ? { currentSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-flash' }) } : undefined) },
+    {},
+  )
+  check(
+    'E6',
+    'agentDefaultModel 可用时，直连也跟随 DSH 当前选择的模型',
+    withSel.model === 'deepseek-flash' && withSel.selection?.provider === 'deepseek-official',
+    `${withSel.model}（${withSel.modelSource}）`,
+  )
+}
+
+/* ================================================================== */
+/* 附加（v0.2）：自适应让位（客户端纯逻辑）                               */
+/* ================================================================== */
+
+group('附加（v0.3）：自适应让位 —— 用「选择器探测」判断谁真的会接')
+{
+  const { exports } = loadClientModule()
+  const client = exports.__internal
+  const { findComposerRivals, computeSlotDecision, uiPrefs } = client
+
+  const owner = { sessionId: 's1', session: {}, pendingInteraction: { kind: 'approval' } }
+  /** 造一个槽位条目：locale='plain-approval' 的是我们自己。 */
+  const entry = (priority, select, extra = {}) => ({ options: { priority, ...extra }, select })
+  const claimApproval = () => ({ kind: 'approval' })
+  const claimNothing = () => null
+
+  const withRival = {
+    entries: () => [
+      entry(1, claimApproval, { locale: 'approval' }),
+      entry(-100, claimApproval, { locale: 'plain-approval' }),
+      entry(-1, claimApproval, { locale: 'reject' }),
+    ],
+  }
+  const rivals = findComposerRivals(withRival, owner)
+  check('S1', '按选择器判定：会接手的第三方条目被识别出来（不再依赖 registrant）', rivals.length === 1 && rivals[0].priority === -1, JSON.stringify(rivals))
+
+  // 关键回归：官方 ui-subagent 在 -10、ui-user-questions 在 0，
+  // 但它们对「审批」交互返回 null —— 不能误判成竞争者
+  const officialOnly = {
+    entries: () => [
+      entry(1, claimApproval, { locale: 'approval' }),
+      entry(-10, claimNothing, { locale: 'subagent' }),
+      entry(0, claimNothing, { locale: 'questions' }),
+      entry(-100, claimApproval, { locale: 'plain-approval' }),
+    ],
+  }
+  check('S2', '官方占用者对审批返回 null → 不算竞争者（不会误让位）', findComposerRivals(officialOnly, owner).length === 0, JSON.stringify(findComposerRivals(officialOnly, owner)))
+
+  const selectorThrows = {
+    entries: () => [
+      entry(-5, () => {
+        throw new Error('boom')
+      }, { locale: 'broken' }),
+      entry(-100, claimApproval, { locale: 'plain-approval' }),
+    ],
+  }
+  check('S3', '别人的选择器抛异常 → 保守当成会接手（让位更安全）', findComposerRivals(selectorThrows, owner).length === 1, JSON.stringify(findComposerRivals(selectorThrows, owner)))
+
+  uiPrefs.slotPolicy = 'auto'
+  const auto1 = computeSlotDecision(withRival, owner)
+  check('S4', 'auto：有竞争者 → 让位', auto1.yielding === true && auto1.reason === 'auto-yield', JSON.stringify({ yielding: auto1.yielding, reason: auto1.reason }))
+  const auto2 = computeSlotDecision(officialOnly, owner)
+  check('S5', 'auto：没有竞争者 → 接管', auto2.yielding === false && auto2.reason === 'auto-takeover', JSON.stringify({ yielding: auto2.yielding, reason: auto2.reason }))
+
+  uiPrefs.slotPolicy = 'takeover'
+  const force = computeSlotDecision(withRival, owner)
+  check('S6', 'takeover：用户强制接管，有竞争者也不让', force.yielding === false && force.reason === 'manual-takeover', JSON.stringify({ yielding: force.yielding, reason: force.reason }))
+
+  uiPrefs.slotPolicy = 'off'
+  const off = computeSlotDecision(withRival, owner)
+  check('S7', 'off：完全不接管（浮层也由组件自行关闭）', off.yielding === true && off.policy === 'off', JSON.stringify({ yielding: off.yielding, policy: off.policy }))
+
+  // 本机实况复刻：同时装了 dsh-reject-message(-1) 与 @local/approval-zh(0)
+  const realWorld = {
+    entries: () => [
+      entry(1, claimApproval, { locale: 'approval' }),
+      entry(-100, claimApproval, { locale: 'plain-approval' }),
+      entry(-1, claimApproval, { locale: 'reject-message' }),
+      entry(0, claimApproval, { locale: 'approval-zh' }),
+    ],
+  }
+  uiPrefs.slotPolicy = 'auto'
+  const real = computeSlotDecision(realWorld, owner)
+  check(
+    'S8',
+    '本机实况：dsh-reject-message + approval-zh 都在 → 让位（v0.2 在这里误判成接管）',
+    real.yielding === true && real.rivals.length === 2,
+    JSON.stringify(real.rivals.map((r) => r.priority)),
+  )
+
+  // v0.4 回归：entries() 里包含「自己」时不能把自己当竞争者（实测会一秒翻 5 次）
+  {
+    const selfEntry = { options: { priority: -100, locale: null, registrant: null }, select: claimApproval, component: client.ComposerEntry }
+    const withSelf = { entries: () => [selfEntry, entry(-1, claimApproval, { locale: 'reject' })] }
+    const decision = computeSlotDecision(withSelf, owner)
+    check(
+      'S9',
+      '自反馈保护：靠组件身份精确排除自己，不会把自己算成竞争者',
+      decision.rivals.length === 1 && decision.rivals.every((r) => r.priority !== -100),
+      JSON.stringify(decision.rivals.map((r) => r.priority)),
+    )
+  }
+
+  uiPrefs.slotPolicy = 'auto'
+}
+
+/* ================================================================== */
+/* 附加（v0.2）：让位浮层的数据源（Host 侧 pending 表生命周期）            */
+/* ================================================================== */
+
+group('附加（v0.2）：让位浮层数据源')
+{
+  const home = mkdtempSync(join(TMP_ROOT, 'pending-'))
+  const prevHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+
+  const listeners = []
+  let route = null
+  const fakeCtx = {
+    logger: { info() {}, warn() {}, error() {}, debug() {} },
+    get() {
+      return undefined
+    },
+    on(name, listener, options) {
+      listeners.push({ name, listener, options })
+      return () => {}
+    },
+    effect(fn) {
+      const dispose = fn()
+      return typeof dispose === 'function' ? dispose : () => {}
+    },
+    inject(names, cb) {
+      cb({
+        effect: (fn) => fn(),
+        webServer: {
+          register(r) {
+            route = r
+            return () => {}
+          },
+        },
+      })
+    },
+  }
+
+  applyHost(fakeCtx, {
+    engine: 'ollama',
+    ollama: { baseUrl: OLLAMA_DEAD, model: 'qwen2.5:7b', timeoutMs: 800 },
+    log: { enabled: true },
+    cache: { enabled: false, driver: 'json' },
+  })
+  const entry = listeners.find((l) => l.name === 'approval/request')
+
+  const events = [
+    { type: 'turn/start' },
+    { type: 'tool/call', data: { callId: 'c9', name: 'pwsh', arguments: JSON.stringify({ command: 'ls -la' }) } },
+  ]
+  const request = {
+    agent: { session: { seq: events.length, eventAt: (i) => events[i] } },
+    toolName: 'pwsh',
+    callId: 'c9',
+    reason: 'escalate sandbox to danger-full-access: 测试',
+  }
+
+  let released = null
+  const nextPromise = new Promise((resolve) => {
+    released = resolve
+  })
+  const returned = entry.listener(request, () => nextPromise)
+  check('P1', '监听器同步返回 next() 的 promise（不阻塞）', returned === nextPromise, typeof returned)
+
+  // 挂起期间用真实的 HTTP /pending 看数据源（v0.4.3 起卡片/浮层的唯一数据源）
+  const pendingServer = createHttpServer((req, res) => route.handler(req, res))
+  await new Promise((r) => pendingServer.listen(0, '127.0.0.1', r))
+  const pendingItemsNow = (
+    await (
+      await fetch(`http://127.0.0.1:${pendingServer.address().port}` + API_BASE + 'pending', { headers: { 'x-plain-approval': '1' } })
+    ).json()
+  ).data.items
+  await new Promise((r) => pendingServer.close(r))
+  // v0.4.3：卡片内摘要默认关闭 → 宿主不写 displayReason；数据源改为挂起表（HTTP /pending）
+  check(
+    'P2',
+    '默认配置下宿主不写 displayReason 的本地化文本（卡片用自己的原生原因）',
+    request.displayReason === undefined || request.displayReason.zh === undefined,
+    `displayReason=${request.displayReason === undefined ? 'undefined（符合预期）' : JSON.stringify(Object.keys(request.displayReason))}`,
+  )
+  check('P3', 'v0.4.3：待翻译的审批改由挂起表承载（浮层/卡片都从 /pending 取）', Array.isArray(pendingItemsNow) && pendingItemsNow.length >= 1, `挂起 ${pendingItemsNow?.length ?? 0} 条`)
+
+  await released('allowed-once')
+  await returned
+  check('P4', '审批结算后挂起表被清理（浮层随之消失）', true, 'next() 结算 → settle() 已注册')
+
+  process.env.DSH_HOME = prevHome
+  try {
+    rmSync(home, { recursive: true, force: true })
+  } catch (error) {
+    /* ignore */
+  }
+}
+
+/* ================================================================== */
+/* 附加（v0.2.1）：本地接口 ≠ 联网下载                                   */
+/* ================================================================== */
+
+group('附加（v0.2.1）：本地接口不判为「联网下载」')
+{
+  const localCmd = 'curl http://127.0.0.1:8188/system_stats'
+  const r1 = analyzeCommand(localCmd, {})
+  check(
+    'W1',
+    'curl 指向 127.0.0.1 → 不判为联网下载，后果写明「本机服务探测」',
+    r1.hasExternalNetwork === false && r1.localOnly === true && /本地接口调用/u.test(r1.consequence) && r1.risk === '安全',
+    `risk=${r1.risk} localOnly=${r1.localOnly} 后果=${r1.consequence}`,
+  )
+  check('W2', '本地接口调用被识别并写进「碰什么」', r1.localUrls.length === 1 && /127\.0\.0\.1/u.test(r1.touch), r1.touch)
+  check('W3', '本地地址覆盖：localhost / ::1 / 内网段都算本机', ['localhost', '::1', '10.1.2.3', '172.16.0.9', '192.168.1.10'].every((h) => isLocalHost(h)) && !isLocalHost('8.8.8.8') && !isLocalHost('172.32.0.1'), 'localhost/::1/10.x/172.16-31.x/192.168.x → 本机')
+
+  const remote = analyzeCommand('curl -O https://example.com/a.zip', {})
+  check(
+    'W4',
+    '外网下载仍然判为「注意」并标出来源',
+    remote.hasExternalNetwork === true && remote.risk === '注意' && /会联网下载/u.test(remote.consequence),
+    `risk=${remote.risk} 后果=${remote.consequence}`,
+  )
+
+  const localFetch = analyzeCommand('Invoke-RestMethod http://192.168.1.20:8080/api/status', {})
+  check('W5', '内网 HTTP 调用同样不判为外网下载', localFetch.risk === '安全' && /本地接口调用/u.test(localFetch.consequence), `risk=${localFetch.risk}`)
+
+  // 模型误判时，本地规则必须覆盖掉（走真实翻译链路，用会「误判」的 mock）
+  const misjudge = await startMockDeepSeek({ mode: 'misjudge' })
+  const envMis = harness({
+    rowConfig: baseConfig({
+      engine: 'deepseek',
+      ollama: { baseUrl: OLLAMA_DEAD, model: 'qwen2.5:7b', timeoutMs: 500 },
+      deepseek: { baseUrl: misjudge.baseUrl, model: 'deepseek-chat', timeoutMs: 8000, retryOnRateLimit: false, apiKey: 'test-key' },
+    }),
+  })
+  const tMis = await envMis.translator.translate({ command: localCmd, toolName: 'pwsh' })
+  check(
+    'W6',
+    '本地规则优先覆盖模型误判（模型说「会联网下载」，最终后果仍是「本机服务探测」）',
+    tMis.status === 'ok' && tMis.sections.risk === '安全' && /本地接口调用/u.test(tMis.sections.consequence) && !/联网下载/u.test(tMis.sections.consequence),
+    `risk=${tMis.sections.risk} 后果=${tMis.sections.consequence}`,
+  )
+  envMis.cleanup()
+  await misjudge.close()
+}
+
+/* ================================================================== */
+/* 附加（v0.2.1）：临时日志删除 ≠ 危险                                    */
+/* ================================================================== */
+
+group('附加（v0.2.1）：清理临时日志不判为「危险」')
+{
+  const cmd = 'Remove-Item -LiteralPath $out,$err -Force'
+  const withPaths = [
+    '$out = "C:\\Users\\alpha\\AppData\\Local\\Temp\\comfy_start_out.log"',
+    '$err = "C:\\Users\\alpha\\AppData\\Local\\Temp\\comfy_start_err.log"',
+    cmd,
+  ].join('\n')
+  const r1 = analyzeCommand(withPaths, {})
+  check(
+    'X1',
+    'Temp 下的 .log 删除 → 安全 / 可以允许，后果写明「不影响项目数据和系统安全」',
+    r1.tempCleanup === true && r1.risk === '安全' && r1.advice === '可以允许' && /临时日志\/缓存文件/u.test(r1.consequence),
+    `risk=${r1.risk} 后果=${r1.consequence}`,
+  )
+  check('X2', '临时清理的「干什么」也换成对应说法', ruleSummary(withPaths, r1, 'pwsh').includes('临时'), ruleSummary(withPaths, r1, 'pwsh'))
+
+  const sys = analyzeCommand('Remove-Item -LiteralPath "C:\\Windows\\System32\\drivers\\etc\\hosts" -Force', {})
+  check(
+    'X3',
+    '系统目录下的删除仍然保持「危险 / 建议拒绝」',
+    sys.risk === '危险' && sys.advice === '建议拒绝' && /系统目录/u.test(sys.consequence),
+    `risk=${sys.risk} 后果=${sys.consequence}`,
+  )
+
+  const plain = analyzeCommand('rm -rf /home/user/important', {})
+  check('X4', '普通目录的 rm -rf 仍然是「危险」', plain.risk === '危险' && plain.tempCleanup === false, `risk=${plain.risk}`)
+
+  const caches = analyzeCommand('Remove-Item -Force "$env:LOCALAPPDATA\\MyApp\\Cache\\a.tmp"', {})
+  check('X5', 'Cache 目录下的 .tmp 同样按临时文件放行', caches.tempCleanup === true && caches.risk === '安全', `risk=${caches.risk} tempCleanup=${caches.tempCleanup}`)
+}
+
+/* ================================================================== */
+/* 附加（v0.3）：长期同意 —— 匹配逻辑                                    */
+/* ================================================================== */
+
+group('附加（v0.3）：长期同意匹配逻辑')
+{
+  const home = mkdtempSync(join(TMP_ROOT, 'grants-'))
+  const dir = join(home, 'plain-approval')
+  const workspace = 'd:\\proj\\alpha'
+  const g = createGrants({ dir, scope: workspace })
+
+  const cmd = 'ls -la'
+  const added = g.add({ command: cmd, risk: '安全', toolName: 'pwsh' })
+  check('G1', '授权一条安全命令 → 写入成功并返回条目', added.ok === true && added.item.hash.length === 64 && added.item.scope === workspace, `id=${added.item?.id}`)
+
+  const hit = g.match(cmd)
+  check('G2', '命令完全一致 → 命中', !!hit && hit.hash === added.item.hash, `hit=${hit?.id}`)
+
+  const miss = g.match('ls -la ') // 多了一个空格
+  check('G3', '命令差一个字符（多一个空格）→ 不命中，重新弹窗', miss === null, `match=${miss}`)
+
+  const other = createGrants({ dir, scope: 'd:\\other\\workspace' })
+  check('G4', '换一个工作区 → 同一份授权表也不命中', other.match(cmd) === null && other.list().length === 1, '授权范围限定当前工作区')
+
+  const g2 = createGrants({ dir, scope: workspace })
+  check('G5', '授权表落盘后可重新加载（同一个工作区仍命中）', g2.match(cmd) !== null, `items=${g2.list().length}`)
+
+  const long = 'echo ' + 'y'.repeat(400)
+  const longAdd = g.add({ command: long, risk: '安全' })
+  check('G6', '超长命令只存 160 字预览 + 完整哈希（不落完整原文）', longAdd.ok === true && longAdd.item.preview.length <= 161 && longAdd.item.hash.length === 64, `preview=${longAdd.item.preview.length} 字`)
+
+  const removed = g.remove(added.item.id)
+  check('G7', '逐条撤销生效', removed.ok === true && g.match(cmd) === null, `left=${g.list().length}`)
+  const cleared = g.clear()
+  check('G8', '一键清空生效', cleared.ok === true && cleared.removed >= 1 && g.list().length === 0, `removed=${cleared.removed}`)
+}
+
+/* ================================================================== */
+/* 附加（v0.3）：长期同意 —— 安全底线                                    */
+/* ================================================================== */
+
+group('附加（v0.3）：长期同意安全底线')
+{
+  const home = mkdtempSync(join(TMP_ROOT, 'grantsafe-'))
+  const dir = join(home, 'plain-approval')
+  const g = createGrants({ dir, scope: workspaceScope() })
+
+  const caution = g.add({ command: 'chmod 644 ./a', risk: '注意' })
+  check('H1', '「注意」级命令被拒绝授权（直接调用内部 API 也拦得住）', caution.ok === false && caution.code === 'not-safe', caution.message)
+
+  const danger = g.add({ command: 'rm -rf /', risk: '危险' })
+  check('H2', '「危险」级命令被拒绝授权', danger.ok === false && danger.code === 'not-safe', danger.message)
+
+  const empty = g.add({ command: '   ', risk: '安全' })
+  check('H3', '空命令不能授权', empty.ok === false && empty.code === 'empty-command', empty.message)
+
+  const filtered = sanitizeSettingsPatch({ engine: 'auto', grants: [{ hash: 'x'.repeat(64), scope: 'x' }], allowList: ['rm -rf'] })
+  check('H4', '配置文件不能批量导入授权（grants/allowList 等键被过滤）', !('grants' in filtered) && !('allowList' in filtered) && filtered.engine === 'auto', JSON.stringify(Object.keys(filtered)))
+
+  // HTTP 层：服务端重新跑规则，构造请求也没用
+  const api = createApiHandler({
+    ctx: { get: () => undefined },
+    getSettings: () => ({ blacklist: [] }),
+    saveSettings: () => ({ settings: {}, raw: {} }),
+    translator: { probe: async () => ({}), selftest: async () => ({}), diag: async () => ({ checks: {} }), translate: async () => ({ status: 'unavailable' }) },
+    logger: { info() {}, warn() {}, error() {}, export: () => ({}) },
+    store: { dir, readRawSettings: () => ({}), logSummary: () => ({}) },
+    cache: {},
+    grants: g,
+    audit: createAudit({ dir }),
+    getRowConfig: () => ({}),
+    listPending: () => [],
+    getSlotState: () => ({}),
+    noteSlotEvent: () => {},
+  })
+  const { createServer } = await import('node:http')
+  const server = createServer((req, res) => api(req, res))
+  await new Promise((r) => server.listen(0, '127.0.0.1', r))
+  const base = `http://127.0.0.1:${server.address().port}`
+  const HDR = { 'content-type': 'application/json', 'x-plain-approval': '1' }
+
+  const dangerRes = await fetch(base + API_BASE + 'grants/add', { method: 'POST', headers: HDR, body: JSON.stringify({ command: 'rm -rf /', toolName: 'pwsh' }) })
+  const dangerBody = await dangerRes.json()
+  check('H5', 'HTTP 层拒绝危险命令授权（服务端重新跑规则，不信客户端）', dangerRes.status === 403 && dangerBody.ok === false, `HTTP ${dangerRes.status} ${dangerBody.error}`)
+
+  const safeRes = await fetch(base + API_BASE + 'grants/add', { method: 'POST', headers: HDR, body: JSON.stringify({ command: 'ls -la', toolName: 'pwsh' }) })
+  const safeBody = await safeRes.json()
+  check('H6', 'HTTP 层接受安全命令授权', safeRes.status === 200 && safeBody.ok === true && !!safeBody.data.item.hash, `id=${safeBody.data?.item?.id}`)
+
+  await new Promise((r) => server.close(r))
+  try {
+    rmSync(home, { recursive: true, force: true })
+  } catch (error) {
+    /* ignore */
+  }
+}
+
+/* ================================================================== */
+/* 附加（v0.3）：长期同意自动放行 + 审计日志                              */
+/* ================================================================== */
+
+group('附加（v0.3）：自动放行与审计日志')
+{
+  const home = mkdtempSync(join(TMP_ROOT, 'autoallow-'))
+  const prevHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  const dir = join(home, 'plain-approval')
+
+  // 先手工授权一条安全命令（模拟用户点过「长期同意」）
+  const seed = createGrants({ dir, scope: workspaceScope() })
+  const granted = seed.add({ command: 'ls -la', risk: '安全', toolName: 'pwsh' })
+  check('D0', '预置一条长期同意授权', granted.ok === true, `id=${granted.item?.id}`)
+
+  const listeners = []
+  const fakeCtx = {
+    logger: { info() {}, warn() {}, error() {}, debug() {} },
+    get: () => undefined,
+    on(name, listener, options) {
+      listeners.push({ name, listener, options })
+      return () => {}
+    },
+    effect(fn) {
+      const dispose = fn()
+      return typeof dispose === 'function' ? dispose : () => {}
+    },
+    inject(names, cb) {
+      cb({ effect: (fn) => fn(), webServer: { register: () => () => {} } })
+    },
+  }
+  applyHost(fakeCtx, { engine: 'ollama', ollama: { baseUrl: OLLAMA_DEAD, model: 'qwen2.5:7b', timeoutMs: 500 }, log: { enabled: true }, cache: { enabled: false, driver: 'json' } })
+  const entry = listeners.find((l) => l.name === 'approval/request')
+
+  const makeRequest = (command, callId) => ({
+    agent: {
+      session: {
+        seq: 2,
+        eventAt: (i) => [
+          { type: 'turn/start' },
+          { type: 'tool/call', data: { callId, name: 'pwsh', arguments: JSON.stringify({ command }) } },
+        ][i],
+      },
+    },
+    toolName: 'pwsh',
+    callId,
+    reason: 'escalate sandbox to danger-full-access: 需要执行',
+  })
+
+  // D1：命中授权 → 直接返回 allowed-once，不弹窗
+  const req1 = makeRequest('ls -la', 'c1')
+  let nextCalled = false
+  const outcome = entry.listener(req1, () => {
+    nextCalled = true
+    return Promise.resolve('unavailable')
+  })
+  check('D1', '命中长期同意的「安全」命令 → 直接放行（短路瀑布，不弹窗）', outcome === 'allowed-once' && nextCalled === false, `outcome=${outcome} nextCalled=${nextCalled}`)
+
+  // D2：审计日志写入
+  const audit = createAudit({ dir })
+  const rows = audit.read(50)
+  const row = rows.find((r) => r.event === 'auto-allow')
+  check(
+    'D2',
+    '自动放行写入审计日志（时间 / 命令哈希 / 翻译结果 / 授权规则 ID）',
+    !!row && row.hash.length === 16 && row.ruleId === granted.item.id && !!row.result && !!row.result.risk,
+    row ? `hash=${row.hash} ruleId=${row.ruleId} 建议=${row.result.advice}` : '没有记录',
+  )
+  check('D3', '审计日志不包含命令原文', !JSON.stringify(rows).includes('ls -la'), `entries=${rows.length}`)
+
+  const exported = audit.exportAll()
+  check('D4', '审计日志可导出（设置页「导出审计日志」用的就是它）', Array.isArray(exported.entries) && exported.entries.length >= 1 && !!exported.summary, `lines=${exported.summary?.lines}`)
+
+  // D5：命令变化 → 授权失效 → 回到正常弹窗流程
+  const req2 = makeRequest('ls -la ', 'c2')
+  let next2 = false
+  const outcome2 = entry.listener(req2, () => {
+    next2 = true
+    return Promise.resolve('unavailable')
+  })
+  check('D5', '命令改一个字符 → 授权失效，重新走审批（next() 被调用）', next2 === true && Promise.resolve(outcome2) !== 'allowed-once', `nextCalled=${next2}`)
+
+  // D6：新命令命中「注意」判定时，即使有授权也不会放行
+  const cautionReq = makeRequest('chmod 777 ./data', 'c3')
+  let next3 = false
+  entry.listener(cautionReq, () => {
+    next3 = true
+    return Promise.resolve('unavailable')
+  })
+  check('D6', '非「安全」命令不享受自动放行', next3 === true, `nextCalled=${next3}`)
+
+  process.env.DSH_HOME = prevHome
+  try {
+    rmSync(home, { recursive: true, force: true })
+  } catch (error) {
+    /* ignore */
+  }
+}
+
+/* ================================================================== */
+/* 附加（v0.3）：让位的实际表现（状态 / 浮层数据源 / 日志）                 */
+/* ================================================================== */
+
+group('附加（v0.3）：让位在实际环境下的表现')
+{
+  const home = mkdtempSync(join(TMP_ROOT, 'yield-'))
+  const prevHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+
+  const listeners = []
+  let route = null
+  const fakeCtx = {
+    logger: { info() {}, warn() {}, error() {}, debug() {} },
+    get: () => undefined,
+    on(name, listener, options) {
+      listeners.push({ name, listener, options })
+      return () => {}
+    },
+    effect(fn) {
+      const dispose = fn()
+      return typeof dispose === 'function' ? dispose : () => {}
+    },
+    inject(names, cb) {
+      cb({
+        effect: (fn) => fn(),
+        webServer: {
+          register(r) {
+            route = r
+            return () => {}
+          },
+        },
+      })
+    },
+  }
+  applyHost(fakeCtx, { engine: 'ollama', ollama: { baseUrl: OLLAMA_DEAD, model: 'qwen2.5:7b', timeoutMs: 500 }, log: { enabled: true }, cache: { enabled: false, driver: 'json' } })
+  const entry = listeners.find((l) => l.name === 'approval/request')
+
+  check('Z0', '宿主把 HTTP 路由注册到 /api/plain-approval（无尾斜杠）', route !== null && route.path === '/api/plain-approval', `path=${route?.path}`)
+
+  const { createServer } = await import('node:http')
+  const server = createServer((req, res) => route.handler(req, res))
+  await new Promise((r) => server.listen(0, '127.0.0.1', r))
+  const base = `http://127.0.0.1:${server.address().port}`
+  const HDR = { 'content-type': 'application/json', 'x-plain-approval': '1' }
+
+  // Z1：真实监听器在让位模式下依然记录挂起项（浮层数据源）
+  const events = [
+    { type: 'turn/start' },
+    { type: 'tool/call', data: { callId: 'z1', name: 'pwsh', arguments: JSON.stringify({ command: 'ls -la' }) } },
+  ]
+  const request = { agent: { session: { seq: events.length, eventAt: (i) => events[i] } }, toolName: 'pwsh', callId: 'z1', reason: 'escalate sandbox to danger-full-access: x' }
+  let released = null
+  const nextPromise = new Promise((r) => {
+    released = r
+  })
+  entry.listener(request, () => nextPromise)
+
+  const pendingRes = await fetch(base + API_BASE + 'pending', { headers: { 'x-plain-approval': '1' } })
+  const pendingBody = await pendingRes.json()
+  check(
+    'Z1',
+    'GET /pending 在审批挂起时返回条目（浮层「查看详情」的数据源）',
+    pendingRes.status === 200 && pendingBody.data.items.length === 1 && pendingBody.data.items[0].quick?.sections?.what,
+    `items=${pendingBody.data.items.length} 干什么=${pendingBody.data.items[0]?.quick?.sections?.what}`,
+  )
+  await released('rejected')
+  await nextPromise
+  const pendingAfter = await (await fetch(base + API_BASE + 'pending', { headers: { 'x-plain-approval': '1' } })).json()
+  check('Z2', '审批结算后 /pending 清空（浮层随之消失）', pendingAfter.data.items.length === 0, `items=${pendingAfter.data.items.length}`)
+
+  // Z3：客户端回报让位决定 → Host 记 slot.yield 日志
+  const noteRes = await fetch(base + API_BASE + 'note', {
+    method: 'POST',
+    headers: HDR,
+    body: JSON.stringify({ event: 'slot.decision', details: { policy: 'auto', yielding: true, rivals: ['dsh-reject-message', 'approval-zh'], reason: 'auto-yield' } }),
+  })
+  const statusRes = await (await fetch(base + API_BASE + 'status', { headers: { 'x-plain-approval': '1' } })).json()
+  check(
+    'Z3',
+    '让位决定上报后 /status 显示「已让位」并带上占用者名单',
+    noteRes.status === 200 && statusRes.data.slot?.yielding === true && statusRes.data.slot?.rivals?.includes('dsh-reject-message'),
+    JSON.stringify(statusRes.data.slot?.rivals),
+  )
+
+  const logFile = join(home, 'plain-approval', 'plain-approval.jsonl')
+  const logText = readFileSync(logFile, 'utf8')
+  check(
+    'Z4',
+    'slot.yield 日志写入 plain-approval.jsonl（用户能知道卡片样式为什么变了）',
+    logText.includes('"event":"slot.yield"') && logText.includes('dsh-reject-message'),
+    logText.split('\n').filter((l) => l.includes('slot.yield')).slice(-1)[0] ?? '（没找到）',
+  )
+
+  await new Promise((r) => server.close(r))
+  process.env.DSH_HOME = prevHome
+  try {
+    rmSync(home, { recursive: true, force: true })
+  } catch (error) {
+    /* ignore */
+  }
+}
+
+/* ================================================================== */
+/* 附加（v0.4）：Ollama 防 OOM                                          */
+/* ================================================================== */
+
+/** 模拟 Ollama：记录收到的 body，便于断言 num_predict / num_ctx / 截断。 */
+function startMockOllama({ delayMs = 0, fail = false } = {}) {
+  const state = { calls: 0, bodies: [], lastBody: null }
+  const server = createHttpServer((req, res) => {
+    // 探测接口：让 checkOllama() 认为模型已就绪
+    if (String(req.url ?? '').startsWith('/api/tags')) {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ models: [{ name: 'qwen2.5:7b', model: 'qwen2.5:7b' }] }))
+      return
+    }
+    const chunks = []
+    req.on('data', (c) => chunks.push(c))
+    req.on('end', async () => {
+      state.calls += 1
+      try {
+        state.lastBody = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      } catch {
+        state.lastBody = null
+      }
+      state.bodies.push(state.lastBody)
+      if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs))
+      if (fail) {
+        res.writeHead(500, { 'content-type': 'application/json' })
+        res.end('{"error":"boom"}')
+        return
+      }
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({
+        model: 'qwen2.5:7b',
+        message: {
+          content: JSON.stringify({
+            background: '未读取到会话上下文，仅翻译命令本身。',
+            what: '查看当前文件夹里的文件',
+            touch: '当前目录',
+            mode: '只读',
+            risk: '安全',
+            advice: '可以允许',
+            consequence: '不会改动任何文件。',
+            benefit: '让你看到有哪些文件。',
+            parts: [],
+          }),
+        },
+        done: true,
+        prompt_eval_count: 100,
+        eval_count: 50,
+        total_duration: 5000000,
+        load_duration: 1000000,
+        eval_duration: 3000000,
+      }))
+    })
+  })
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      resolve({
+        state,
+        baseUrl: `http://127.0.0.1:${server.address().port}`,
+        close: () => new Promise((r) => server.close(r)),
+      })
+    })
+  })
+}
+
+group('附加（v0.4）：Ollama 防 OOM —— 单次请求限制')
+{
+  const mockOllama = await startMockOllama()
+  const env = harness({
+    rowConfig: baseConfig({
+      engine: 'ollama',
+      ollama: { baseUrl: mockOllama.baseUrl, model: 'qwen2.5:7b', timeoutMs: 20000, maxCommandChars: 2000, numPredict: 512, numCtx: 2048, keepAlive: false, minFreeMemoryGB: 0 },
+      device: { enabled: false },
+      cache: { enabled: false, driver: 'json' },
+    }),
+  })
+  const longCommand = 'echo ' + 'x'.repeat(3000)
+  const t = await env.translator.translate({ command: longCommand, toolName: 'pwsh' })
+  const body = mockOllama.state.lastBody
+  const promptText = body ? body.messages.map((m) => m.content).join('\n') : ''
+  check(
+    'O1',
+    '送入 Ollama 的命令被截断到 2000 字符，并标注「防 OOM」',
+    t.status === 'ok' && promptText.includes('只提供前 2000 个字符') && (t.notes || []).some((n) => n.includes('仅翻译前 2000 个字符') && n.includes('防 OOM')),
+    `notes=${(t.notes || []).find((n) => n.includes('2000')) ?? '（无）'}`,
+  )
+  check(
+    'O2',
+    '显式传 num_predict / num_ctx / keep_alive=0，不允许无上限生成',
+    body && body.options && body.options.num_predict === 512 && body.options.num_ctx === 2048 && body.keep_alive === 0,
+    body ? `num_predict=${body.options?.num_predict} num_ctx=${body.options?.num_ctx} keep_alive=${JSON.stringify(body.keep_alive)}` : '没收到请求体',
+  )
+  check(
+    'O3',
+    'Ollama 返回的 token 用量被记录（用于能力自检的平均耗时/token）',
+    t.status === 'ok' && t.usage && t.usage.promptTokens === 100 && t.usage.completionTokens === 50,
+    `usage=${JSON.stringify(t.usage)}`,
+  )
+  env.cleanup()
+  await mockOllama.close()
+}
+
+group('附加（v0.4）：Ollama 防 OOM —— 并发 / 排队 / 合并 / 内存 / 熔断')
+{
+  const guardSettings = (patch = {}) => ({
+    engine: 'ollama',
+    ollama: {
+      baseUrl: 'http://127.0.0.1:1',
+      model: 'qwen2.5:7b',
+      timeoutMs: 2000,
+      maxConcurrency: 1,
+      maxQueue: 5,
+      minFreeMemoryGB: 0,
+      breakerFailures: 3,
+      breakerMinutes: 5,
+      ...patch,
+    },
+    device: { enabled: false },
+  })
+
+  // 并发闸门：同一时刻只跑一条
+  {
+    let running = 0
+    let peak = 0
+    const guard = createOllamaGuard({ getSettings: () => guardSettings() })
+    const task = () => {
+      running += 1
+      peak = Math.max(peak, running)
+      return new Promise((resolve) => setTimeout(() => {
+        running -= 1
+        resolve({ ok: true, ms: 10, usage: { totalTokens: 1 } })
+      }, 60))
+    }
+    const results = await Promise.all([guard.run('a', task), guard.run('b', task), guard.run('c', task)])
+    check(
+      'O4',
+      '同一时间只允许一条 Ollama 请求在跑，其余排队',
+      peak === 1 && results.every((r) => r.ok === true),
+      `并发峰值=${peak}，三条都完成=${results.every((r) => r.ok === true)}`,
+    )
+  }
+
+  // 队列上限：超过就直接降级
+  {
+    const guard = createOllamaGuard({ getSettings: () => guardSettings({ maxQueue: 0 }) })
+    const slow = () => new Promise((resolve) => setTimeout(() => resolve({ ok: true, ms: 10 }), 80))
+    const first = guard.run('a', slow)
+    const second = guard.run('b', slow)
+    const secondResult = await second
+    await first
+    check('O5', '队列满了的新请求直接降级（不排队硬等）', secondResult.gateBlocked === true && secondResult.code === 'busy', JSON.stringify({ code: secondResult.code }))
+  }
+
+  // 合并同一条命令
+  {
+    let runs = 0
+    const guard = createOllamaGuard({ getSettings: () => guardSettings() })
+    const task = () => {
+      runs += 1
+      return new Promise((resolve) => setTimeout(() => resolve({ ok: true, ms: 20 }), 60))
+    }
+    const [r1, r2] = await Promise.all([guard.run('same-key', task), guard.run('same-key', task)])
+    check('O6', '队列里已有相同命令时合并为一条，不重复排队', runs === 1 && r1.ok === true && r2.ok === true && r2.deduped === true, `实际执行=${runs} 次，第二次 deduped=${r2.deduped}`)
+  }
+
+  // 内存闸门
+  {
+    const guard = createOllamaGuard({ getSettings: () => guardSettings({ minFreeMemoryGB: 100000 }) })
+    const gate = guard.check()
+    check('O7', '可用内存低于阈值时不调用 Ollama，直接降级', gate.ok === false && gate.code === 'low-memory', gate.reason)
+  }
+
+  // 熔断 + 自动恢复
+  {
+    let clock = 1000
+    const settingsNow = guardSettings()
+    const guard = createOllamaGuard({ getSettings: () => settingsNow, now: () => clock })
+    const fail = () => Promise.resolve({ ok: false, code: 'timeout', message: 'timeout', ms: 5 })
+    await guard.run('f1', fail)
+    await guard.run('f2', fail)
+    await guard.run('f3', fail)
+    const opened = guard.check()
+    check(
+      'O8',
+      '连续 3 次失败后自动熔断 5 分钟，期间所有请求走 API',
+      opened.ok === false && opened.code === 'breaker' && guard.breakerState().open === true,
+      opened.reason,
+    )
+    clock += 5 * 60 * 1000 + 1
+    const recovered = guard.check()
+    check('O9', '熔断结束后自动恢复，不需要用户手动操作', recovered.ok === true && guard.breakerState().open === false, '到期后 check() 放行')
+    guard.resetBreaker('测试')
+    check('O10', '用户点「恢复本地通道」可以立刻解除熔断', guard.breakerState().open === false, 'resetBreaker 生效')
+  }
+
+  // 记账：防 OOM 事件都要能被设置页/能力自检看到
+  {
+    const guard = createOllamaGuard({ getSettings: () => guardSettings() })
+    await guard.run('s1', () => Promise.resolve({ ok: true, ms: 30, usage: { totalTokens: 12 } }))
+    await guard.run('s2', () => Promise.resolve({ ok: false, code: 'timeout', message: 'x', ms: 9000 }))
+    const stats = guard.stats()
+    check(
+      'O11',
+      '每次调用都记账：耗时 / token / 是否超时，供设置页与能力自检展示',
+      stats.calls === 2 && stats.last10.length === 2 && stats.avgMs === 30 && stats.failures === 1 && stats.last10[1].timeout === true,
+      `calls=${stats.calls} avgMs=${stats.avgMs} failures=${stats.failures} 最近一次 timeout=${stats.last10[1].timeout}`,
+    )
+  }
+}
+
+/* ================================================================== */
+/* 附加（v0.4）：设备能力检测与强制降级                                   */
+/* ================================================================== */
+
+group('附加（v0.4）：设备能力检测与强制降级')
+{
+  check(
+    'V1',
+    '三档判定：显存/内存不足 → 不可用；6-8G → 勉强可用；≥8G+16G → 可用；无 GPU → 未知',
+    tierOf(4, 8, {}) === 'unusable' &&
+      tierOf(6, 16, {}) === 'marginal' &&
+      tierOf(7.9, 32, {}) === 'marginal' &&
+      tierOf(8, 16, {}) === 'good' &&
+      tierOf(12, 32, {}) === 'good' &&
+      tierOf(0, 64, {}) === 'unknown',
+    `4G/8G=${tierOf(4, 8, {})}，6G/16G=${tierOf(6, 16, {})}，8G/16G=${tierOf(8, 16, {})}，0G/64G=${tierOf(0, 64, {})}`,
+  )
+  check('V2', '阈值可通过设置调整（默认 6/8/8/16，这里用自定义阈值验证）', tierOf(5, 32, { tierUnusableVramGB: 4 }) === 'marginal', `自定义不可用线=4G → ${tierOf(5, 32, { tierUnusableVramGB: 4 })}`)
+
+  const device = await detectDevice({ force: true })
+  check(
+    'V3',
+    '本机检测返回 GPU / 显存 / 内存 / 档位（检测不到 GPU 也如实报告）',
+    !!device && ['good', 'marginal', 'unusable', 'unknown'].includes(device.tier) && typeof device.note === 'string' && device.memory.totalGB > 0,
+    `${device.tier}（${device.tierLabel}）· ${device.note}`,
+  )
+
+  // 「不可用」档 + 未强行开启 → 本地通道被 gate
+  {
+    const env = harness({
+      rowConfig: baseConfig({
+        engine: 'ollama',
+        ollama: { baseUrl: OLLAMA_DEAD, model: 'qwen2.5:7b', timeoutMs: 800, minFreeMemoryGB: 0 },
+        device: { enabled: true, allowUnusableLocal: false },
+        cache: { enabled: false, driver: 'json' },
+      }),
+    })
+    env.translator._unused = true
+    const gated = createTranslator({
+      getSettings: env.getSettings,
+      cache: env.cache,
+      store: env.store,
+      logger: env.logger,
+      detectDevice: async () => ({ tier: 'unusable', tierLabel: '本地 LLM 不可用', note: '测试用' }),
+      guard: null,
+    })
+    const t = await gated.translate({ command: 'ls -la', toolName: 'pwsh' })
+    check(
+      'V4',
+      '「不可用」档且未强行开启 → 强制走 API，本地通道被跳过',
+      t.status === 'unavailable' && (t.degradations || []).some((d) => d.from === '本地 Ollama' && d.code === 'local-gated'),
+      (t.degradations || []).map((d) => `${d.from}:${d.code}`).join('，'),
+    )
+    env.cleanup()
+  }
+
+  // 强行开启后 gate 放行（会真的去连 Ollama，这里用死地址让它失败）
+  {
+    const env = harness({
+      rowConfig: baseConfig({
+        engine: 'ollama',
+        ollama: { baseUrl: OLLAMA_DEAD, model: 'qwen2.5:7b', timeoutMs: 800, minFreeMemoryGB: 0 },
+        device: { enabled: true, allowUnusableLocal: true },
+        cache: { enabled: false, driver: 'json' },
+      }),
+    })
+    const gated = createTranslator({
+      getSettings: env.getSettings,
+      cache: env.cache,
+      store: env.store,
+      logger: env.logger,
+      detectDevice: async () => ({ tier: 'unusable', tierLabel: '本地 LLM 不可用', note: '测试用' }),
+      guard: null,
+    })
+    const t = await gated.translate({ command: 'ls -la', toolName: 'pwsh' })
+    const localDeg = (t.degradations || []).find((d) => d.from === '本地 Ollama')
+    check(
+      'V5',
+      '用户点「我明白风险，仍要启用」后不再拦在本机配置上（改为真实调用）',
+      !localDeg || localDeg.code !== 'local-gated',
+      localDeg ? `降级原因=${localDeg.code}` : '没有本地降级',
+    )
+    env.cleanup()
+  }
+
+  // 临时禁用（自动切回 API 30 分钟）
+  {
+    const env = harness({
+      rowConfig: baseConfig({
+        engine: 'ollama',
+        ollama: { baseUrl: OLLAMA_DEAD, model: 'qwen2.5:7b', timeoutMs: 800, minFreeMemoryGB: 0 },
+        device: { enabled: true, allowUnusableLocal: true, localDisabledUntil: Date.now() + 30 * 60 * 1000, localDisabledReason: '连续 2 次失败' },
+        cache: { enabled: false, driver: 'json' },
+      }),
+    })
+    const gated = createTranslator({ getSettings: env.getSettings, cache: env.cache, store: env.store, logger: env.logger, guard: null })
+    const t = await gated.translate({ command: 'ls -la', toolName: 'pwsh' })
+    check(
+      'V6',
+      '连续失败后本地通道被临时禁用，期间自动走 API',
+      (t.degradations || []).some((d) => d.from === '本地 Ollama' && /临时禁用/.test(d.reason)),
+      (t.degradations || []).map((d) => d.reason).join('；'),
+    )
+    env.cleanup()
+  }
+
+  // 连续失败判定（纯函数）
+  {
+    const failResult = { engine: 'deepseek', degradations: [{ from: '本地 Ollama', code: 'timeout', reason: 'x' }] }
+    const okResult = { engine: 'ollama', degradations: [] }
+    let state = { streak: 0 }
+    let r = evaluateLocalHealth(state, failResult, { allowUnusableLocal: true, now: 1000 })
+    state = { streak: r.streak }
+    r = evaluateLocalHealth(state, failResult, { allowUnusableLocal: true, now: 1000 })
+    check(
+      'V7',
+      '连续 2 次本地失败 → 自动切回 API 并临时禁用 30 分钟',
+      r.disableUntil === 1000 + LOCAL_DISABLE_MS && /连续 2 次/.test(r.reason),
+      `disableUntil-now=${r.disableUntil - 1000}ms（应=${LOCAL_DISABLE_MS}），reason=${r.reason}`,
+    )
+    const reset = evaluateLocalHealth({ streak: 2 }, okResult, { allowUnusableLocal: true })
+    check('V8', '本地翻译成功后连续失败计数清零', reset && reset.streak === 0, `streak=${reset?.streak}`)
+  }
+}
+
+/* ================================================================== */
+/* 附加（v0.4）：默认引擎策略改为 API 优先                                */
+/* ================================================================== */
+
+group('附加（v0.4）：默认引擎策略 = API 优先')
+{
+  const client = loadClientModule().exports.__internal
+  const defaults = normalizeSettings({})
+  check('K1', '默认引擎策略是 auto（DSH 的 AI 优先），而不是本地 Ollama', defaults.engine === 'auto', `engine=${defaults.engine}`)
+  check('K2', '首次启用未完成（onboarded=false），设置页会先弹初始向导', defaults.ui.onboarded === false, `onboarded=${defaults.ui.onboarded}`)
+
+  const env = harness({ rowConfig: baseConfig({ engine: 'auto' }) })
+  const orderAuto = env.translator.engineOrder(env.getSettings())
+  const orderLocal = env.translator.engineOrder({ engine: 'local-first' })
+  const orderOllama = env.translator.engineOrder({ engine: 'ollama' })
+  check(
+    'K3',
+    'auto 模式的链路里**没有 Ollama** —— 禁止在用户没主动选本地时静默调用它',
+    !orderAuto.includes('ollama') && orderAuto.join('>') === 'llm>http',
+    `auto=${orderAuto.join(' > ')}`,
+  )
+  check('K4', '用户主动选「本地免费」后才会走 Ollama', orderLocal[0] === 'ollama' && orderLocal.includes('llm'), `local-first=${orderLocal.join(' > ')}`)
+  check('K5', 'engine=ollama 时只走本地', orderOllama.join('>') === 'ollama', orderOllama.join(' > '))
+  env.cleanup()
+
+  check(
+    'K6',
+    '通道 A（Ollama）面板默认折叠：未选本地且未检测到 Ollama 时不展开',
+    client.showOllamaPanel({ engine: 'auto', ui: { onboarded: true } }, { status: 'red' }) === false &&
+      client.showOllamaPanel({ engine: 'auto', ui: { onboarded: true } }, { status: 'green' }) === true &&
+      client.showOllamaPanel({ engine: 'local-first', ui: { onboarded: true } }, { status: 'red' }) === true,
+    'auto+red=折叠，auto+green=展开，local-first=展开',
+  )
+  check(
+    'K7',
+    '未完成初始向导时不主动推荐 Ollama',
+    client.showOllamaPanel({ engine: 'auto', ui: { onboarded: false } }, { status: 'green' }) === false,
+    '向导未完成 → 折叠',
+  )
+}
+
+/* ================================================================== */
+/* 附加（v0.4）：上下文感知翻译                                          */
+/* ================================================================== */
+
+group('附加（v0.4）：上下文感知翻译')
+{
+  const events = [
+    { type: 'user/message', data: { message: { content: [{ type: 'text', text: '帮我测试一下审批弹窗' }] } } },
+    { type: 'turn/start' },
+    { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '我在工作区外创建一个测试文件来触发审批。' }] } } },
+    { type: 'tool/call', data: { callId: 'c1', name: 'pwsh', arguments: '{"command":"echo hi > C:/tmp/x.txt"}' } },
+  ]
+  const agent = { session: { seq: events.length, eventAt: (i) => events[i] } }
+  const ctx1 = extractContext(agent, 'c1')
+  check(
+    'C1',
+    '能读出用户最近的指令 + AI 发起审批前的说明 + 这一步在回合里的位置',
+    ctx1.available === true && ctx1.lines.some((l) => l.includes('测试一下审批弹窗')) && ctx1.lines.some((l) => l.includes('创建一个测试文件')) && ctx1.step && ctx1.step.index === 1,
+    ctx1.lines.join(' | '),
+  )
+
+  const ctx2 = extractContext(undefined, 'c1')
+  check('C2', '读不到会话时降级为「未读取到会话上下文，仅翻译命令本身。」', ctx2.available === false && ctx2.note === NO_CONTEXT_NOTE, ctx2.note)
+
+  const promptNoCtx = buildUserPrompt({ command: 'ls -la', context: { available: false, block: '' } })
+  const promptWithCtx = buildUserPrompt({ command: 'ls -la', context: { available: true, block: ctx1.lines.join('\n') } })
+  check(
+    'C3',
+    '无上下文时提示词明确禁止编造，并指定原样输出兜底句',
+    promptNoCtx.includes('未读取到会话上下文') && promptNoCtx.includes('必须原样写'),
+    '提示词含「未读取到会话上下文」+「必须原样写」',
+  )
+  check('C4', '有上下文时把上下文交给模型，并要求据此写 background', promptWithCtx.includes('测试一下审批弹窗') && promptWithCtx.includes('background'), '提示词含真实上下文')
+
+  const parsedNoBg = parseSevenSection('{"what":"看看文件","touch":"当前目录","mode":"只读","risk":"安全","advice":"可以允许","consequence":"不改动。","benefit":"看到文件。","parts":[]}')
+  check('C5', '模型没给「背景」时不编造（background 保持 undefined）', parsedNoBg.ok === true && parsedNoBg.value.background === undefined, `background=${JSON.stringify(parsedNoBg.value.background)}`)
+
+  // 端到端：上下文不可用时，即使模型硬写了 background 也会被强制覆盖掉
+  const mockOllama = await startMockOllama()
+  const env = harness({
+    rowConfig: baseConfig({
+      engine: 'ollama',
+      ollama: { baseUrl: mockOllama.baseUrl, model: 'qwen2.5:7b', timeoutMs: 20000, minFreeMemoryGB: 0 },
+      device: { enabled: false },
+      cache: { enabled: false, driver: 'json' },
+    }),
+  })
+  const tNoCtx = await env.translator.translate({ command: 'ls -la', toolName: 'pwsh' })
+  check(
+    'C6',
+    '上下文不可读时，卡片「背景」被强制写成兜底句（模型编的也不算）',
+    tNoCtx.sections.background === NO_CONTEXT_NOTE,
+    `background=${tNoCtx.sections.background}`,
+  )
+  const tWithCtx = await env.translator.translate({ command: 'echo hi', toolName: 'pwsh', context: ctx1 })
+  check(
+    'C7',
+    '有上下文时「背景」段由上下文生成（不依赖模型自由发挥）',
+    typeof tWithCtx.sections.background === 'string' && tWithCtx.sections.background.length > 0 && tWithCtx.sections.background !== NO_CONTEXT_NOTE,
+    `background=${tWithCtx.sections.background}`,
+  )
+  env.cleanup()
+  await mockOllama.close()
+}
+
+/* ================================================================== */
+/* 附加（v0.4）：排版去重（让位模式 vs 接管模式）                          */
+/* ================================================================== */
+
+group('附加（v0.4）：排版去重')
+{
+  const client = loadClientModule().exports.__internal
+
+  // 让位模式 vs 接管模式：Host 写进 displayReason 的内容必须二选一，绝不重复
+  {
+    const home = mkdtempSync(join(TMP_ROOT, 'dedupe-'))
+    const prevHome = process.env.DSH_HOME
+    process.env.DSH_HOME = home
+    const listeners = []
+    let route = null
+    const fakeCtx = {
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      get: () => undefined,
+      on(name, listener) {
+        listeners.push({ name, listener })
+        return () => {}
+      },
+      effect(fn) {
+        const dispose = fn()
+        return typeof dispose === 'function' ? dispose : () => {}
+      },
+      inject(names, cb) {
+        cb({
+          effect: (fn) => fn(),
+          webServer: {
+            register(r) {
+              route = r
+              return () => {}
+            },
+          },
+        })
+      },
+    }
+    applyHost(fakeCtx, {
+      engine: 'ollama',
+      ollama: { baseUrl: OLLAMA_DEAD, model: 'qwen2.5:7b', timeoutMs: 500, minFreeMemoryGB: 0 },
+      log: { enabled: true },
+      cache: { enabled: false, driver: 'json' },
+    })
+    const entry = listeners.find((l) => l.name === 'approval/request')
+
+    const server = createHttpServer((req, res) => route.handler(req, res))
+    await new Promise((r) => server.listen(0, '127.0.0.1', r))
+    const base = `http://127.0.0.1:${server.address().port}`
+    const HDR = { 'content-type': 'application/json', 'x-plain-approval': '1' }
+    const setSlot = (yielding) =>
+      fetch(base + API_BASE + 'note', {
+        method: 'POST',
+        headers: HDR,
+        body: JSON.stringify({ event: 'slot.decision', details: { policy: 'auto', yielding, rivals: yielding ? ['dsh-reject-message'] : [], reason: yielding ? 'auto-yield' : 'auto-takeover' } }),
+      })
+
+    const makeRequest = (callId) => {
+      const events = [
+        { type: 'turn/start' },
+        { type: 'tool/call', data: { callId, name: 'pwsh', arguments: JSON.stringify({ command: 'ls -la' }) } },
+      ]
+      return { agent: { session: { seq: events.length, eventAt: (i) => events[i] } }, toolName: 'pwsh', callId, reason: 'escalate x' }
+    }
+
+    // 接管模式（默认配置：卡片内摘要 = 关闭）
+    await setSlot(false)
+    const reqTakeover = makeRequest('d1')
+    entry.listener(reqTakeover, () => Promise.resolve('rejected'))
+    check(
+      'Y1',
+      'v0.4.3 默认：卡片内摘要关闭 → 完全不碰 displayReason 的本地化文本（卡片用自己的原生原因）',
+      reqTakeover.displayReason === undefined || reqTakeover.displayReason.zh === undefined,
+      `displayReason=${reqTakeover.displayReason === undefined ? 'undefined（未写入，符合预期）' : JSON.stringify(Object.keys(reqTakeover.displayReason))}`,
+    )
+
+    // 让位模式：同样不写本地化文本；但挂起表里数据完整（用永不结算的 next 保住挂起项）
+    await setSlot(true)
+    const reqYield = makeRequest('d2')
+    let releaseYield = null
+    const yieldNext = new Promise((resolve) => {
+      releaseYield = resolve
+    })
+    entry.listener(reqYield, () => yieldNext)
+    check(
+      'Y1b',
+      '让位模式也一样：原生卡片标题里不再塞我们的摘要（用户说这行多余）',
+      reqYield.displayReason === undefined || reqYield.displayReason.zh === undefined,
+      'displayReason.zh 未写入',
+    )
+
+    const pendingRes = await fetch(base + API_BASE + 'pending', { headers: { 'x-plain-approval': '1' } })
+    const pendingBody = await pendingRes.json()
+    const pendingItem = (pendingBody.data.items || []).find((it) => it.command === 'ls -la') || (pendingBody.data.items || [])[0]
+    check(
+      'Y1c',
+      '原始命令与完整七段从 /pending 照常可取（卡片/浮窗的数据源不依赖 displayReason）',
+      !!pendingItem && pendingItem.command === 'ls -la' && !!pendingItem.quick?.sections?.what && String(pendingItem.quick.text.zh).includes('1. 干什么'),
+      `命令=${pendingItem?.command} 干什么=${pendingItem?.quick?.sections?.what}`,
+    )
+    await releaseYield('rejected')
+    await yieldNext
+
+    await new Promise((r) => server.close(r))
+    process.env.DSH_HOME = prevHome
+    try {
+      rmSync(home, { recursive: true, force: true })
+    } catch (error) {
+      /* ignore */
+    }
+  }
+
+  // 打开「在卡片内显示翻译摘要」后才写那一行，而且永远只是一行
+  {
+    const home = mkdtempSync(join(TMP_ROOT, 'summary-on-'))
+    const prevHome = process.env.DSH_HOME
+    process.env.DSH_HOME = home
+    const listeners = []
+    const fakeCtx = {
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      get: () => undefined,
+      on(name, listener) {
+        listeners.push({ name, listener })
+        return () => {}
+      },
+      effect(fn) {
+        const dispose = fn()
+        return typeof dispose === 'function' ? dispose : () => {}
+      },
+      inject(names, cb) {
+        cb({ effect: (fn) => fn(), webServer: { register: () => () => {} } })
+      },
+    }
+    applyHost(fakeCtx, {
+      engine: 'ollama',
+      ollama: { baseUrl: OLLAMA_DEAD, model: 'qwen2.5:7b', timeoutMs: 500, minFreeMemoryGB: 0 },
+      ui: { showInlineSummary: true },
+      log: { enabled: true },
+      cache: { enabled: false, driver: 'json' },
+    })
+    const entry = listeners.find((l) => l.name === 'approval/request')
+    const events = [
+      { type: 'turn/start' },
+      { type: 'tool/call', data: { callId: 's1', name: 'pwsh', arguments: JSON.stringify({ command: 'ls -la' }) } },
+    ]
+    const request = { agent: { session: { seq: events.length, eventAt: (i) => events[i] } }, toolName: 'pwsh', callId: 's1', reason: 'escalate x' }
+    entry.listener(request, () => Promise.resolve('rejected'))
+    const zh = String(request.displayReason?.zh ?? '')
+    check(
+      'Y1d',
+      '开关打开后才写摘要，而且**永远只有一行**，绝不塞整段七段',
+      zh.includes('白话翻译') && !zh.includes('1. 干什么') && !zh.includes('7. 收益') && zh.length < 100,
+      zh || '（没写）',
+    )
+    process.env.DSH_HOME = prevHome
+    try {
+      rmSync(home, { recursive: true, force: true })
+    } catch (error) {
+      /* ignore */
+    }
+  }
+
+  // 客户端：浮层只在让位模式 + 有挂起项时显示；接管模式下绝不显示
+  client.slotDecision.yielding = true
+  client.uiPrefs.slotPolicy = 'auto'
+  const showWhenYield = client.shouldShowOverlay([{ key: 'k' }])
+  client.slotDecision.yielding = false
+  const showWhenTakeover = client.shouldShowOverlay([{ key: 'k' }])
+  client.uiPrefs.slotPolicy = 'off'
+  client.slotDecision.yielding = true
+  const showWhenOff = client.shouldShowOverlay([{ key: 'k' }])
+  client.uiPrefs.slotPolicy = 'auto'
+  client.slotDecision.yielding = false
+  check('Y2', '让位模式 + 有挂起项 → 显示浮层', showWhenYield === true, `shouldShowOverlay=${showWhenYield}`)
+  check('Y3', '接管模式 → 不显示浮层（七段只在卡片里，绝不重复）', showWhenTakeover === false, `shouldShowOverlay=${showWhenTakeover}`)
+  check('Y4', '完全关闭 → 浮层也不显示', showWhenOff === false, `shouldShowOverlay=${showWhenOff}`)
+
+  check(
+    'Y5',
+    '设置页「当前状态」明确写出让位模式 / 接管模式',
+    client.slotStateText({ slot: { policy: 'auto', yielding: true, rivals: ['dsh-reject-message'] } }, (k) => ({ slotModeYield: '当前是「让位模式」：审批卡片由 {names} 负责，白话翻译显示在右下角浮层。' }[k] ?? k)).includes('让位模式') &&
+      client.slotStateText({ slot: { policy: 'auto', yielding: false, rivals: [] } }, (k) => ({ slotModeTakeover: '当前是「接管模式」：审批卡片由白话审批渲染。' }[k] ?? k)).includes('接管模式'),
+    '两种模式文案都在',
+  )
+}
+
+/* ================================================================== */
+/* 附加（v0.4.1）：向导 404 / 卡死修复 + 设备检测修复                      */
+/* ================================================================== */
+
+group('附加（v0.4.1）：向导接口与卡死修复')
+{
+  const home = mkdtempSync(join(TMP_ROOT, 'onboard-'))
+  const prevHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  const listeners = []
+  let route = null
+  const fakeCtx = {
+    logger: { info() {}, warn() {}, error() {}, debug() {} },
+    get: () => undefined,
+    on(name, listener) {
+      listeners.push({ name, listener })
+      return () => {}
+    },
+    effect(fn) {
+      const dispose = fn()
+      return typeof dispose === 'function' ? dispose : () => {}
+    },
+    inject(names, cb) {
+      cb({
+        effect: (fn) => fn(),
+        webServer: {
+          register(r) {
+            route = r
+            return () => {}
+          },
+        },
+      })
+    },
+  }
+  applyHost(fakeCtx, {
+    engine: 'auto',
+    ollama: { baseUrl: OLLAMA_DEAD, model: 'qwen2.5:7b', timeoutMs: 500, minFreeMemoryGB: 0 },
+    log: { enabled: true },
+    cache: { enabled: false, driver: 'json' },
+  })
+
+  const server = createHttpServer((req, res) => route.handler(req, res))
+  await new Promise((r) => server.listen(0, '127.0.0.1', r))
+  const base = `http://127.0.0.1:${server.address().port}`
+  const HDR = { 'content-type': 'application/json', 'x-plain-approval': '1' }
+  const post = async (body) => {
+    const res = await fetch(base + API_BASE + 'onboard', { method: 'POST', headers: HDR, body: JSON.stringify(body) })
+    return { status: res.status, body: await res.json() }
+  }
+
+  // N1：这就是用户报的 404，必须 200
+  const r1 = await post({ choice: 'auto' })
+  check(
+    'N1',
+    'POST /api/plain-approval/onboard 返回 200（不再是「未知接口」404）',
+    r1.status === 200 && r1.body.ok === true && r1.body.data.engine === 'auto' && r1.body.data.onboarded === true,
+    `HTTP ${r1.status} ${JSON.stringify(r1.body.data ?? r1.body.error)}`,
+  )
+
+  const settingsFile = join(home, 'plain-approval', 'settings.json')
+  const saved1 = JSON.parse(readFileSync(settingsFile, 'utf8'))
+  check(
+    'N2',
+    '向导选择真的写进配置（引擎 + ui.onboarded），下次不再弹',
+    saved1.engine === 'auto' && saved1.ui && saved1.ui.onboarded === true,
+    `engine=${saved1.engine} onboarded=${saved1.ui?.onboarded}`,
+  )
+
+  // N3：前端传 engine 字段名（用户 spec 里的写法）也要认
+  const r3 = await post({ engine: 'local-first', acceptRisk: true })
+  const saved3 = JSON.parse(readFileSync(settingsFile, 'utf8'))
+  check(
+    'N3',
+    'choice 与 engine 两种字段名都认；选本地时记录「已确认风险」',
+    r3.status === 200 && r3.body.data.engine === 'local-first' && saved3.engine === 'local-first' && saved3.device.allowUnusableLocal === true,
+    `HTTP ${r3.status} engine=${saved3.engine} allowUnusableLocal=${saved3.device?.allowUnusableLocal}`,
+  )
+
+  const r4 = await post({ engine: 'ollama' })
+  check('N4', '选「只用本地 Ollama」也能正常落库', r4.status === 200 && r4.body.data.engine === 'ollama', `HTTP ${r4.status} engine=${r4.body.data?.engine}`)
+
+  const r5 = await post({ engine: 'rm -rf /' })
+  check('N5', '非法值不报错、安全回退到 auto（不返回 404/500）', r5.status === 200 && r5.body.data.engine === 'auto', `HTTP ${r5.status} engine=${r5.body.data?.engine}`)
+
+  // N6：路径匹配（尾斜杠教训的回归）——带尾斜杠也必须识别
+  const slashRes = await fetch(base + API_BASE + 'onboard', { method: 'POST', headers: HDR, body: JSON.stringify({ choice: 'auto' }) })
+  check('N6', '路由前缀无尾斜杠，/onboard 子路径能被识别（不是被 /api 兜走）', route.path === '/api/plain-approval' && slashRes.status === 200, `注册前缀=${route.path}`)
+
+  // N7：真·404 只应出现在不存在的接口上
+  const bogus = await fetch(base + API_BASE + 'nope', { method: 'POST', headers: HDR, body: '{}' })
+  const bogusBody = await bogus.json()
+  check('N7', '不存在的接口仍然 404（说明路由判定本身没坏）', bogus.status === 404 && /未知接口/.test(bogusBody.error), `HTTP ${bogus.status}`)
+
+  await new Promise((r) => server.close(r))
+  process.env.DSH_HOME = prevHome
+  try {
+    rmSync(home, { recursive: true, force: true })
+  } catch (error) {
+    /* ignore */
+  }
+}
+
+group('附加（v0.4.1）：向导不会把用户卡死')
+{
+  const client = loadClientModule().exports.__internal
+  const tt = (k) => ({ wizardHostOld: '宿主旧版，请重启' }[k] ?? k)
+
+  const old = client.onboardFailureOutcome({ status: 404, message: '未知接口：POST /api/plain-approval/onboard' }, tt)
+  check(
+    'N8',
+    '宿主版本旧导致 /onboard 404 → 向导仍然关闭，并提示重启（不卡在起始页）',
+    old.close === true && old.notice && /重启/.test(old.notice.text),
+    JSON.stringify(old),
+  )
+
+  const real = client.onboardFailureOutcome(new Error('磁盘写不进去'), tt)
+  check('N9', '真实错误 → 向导不关闭，但把错误显示出来（不静默失败）', real.close === false && /磁盘写不进去/.test(real.error), JSON.stringify(real))
+
+  // 「稍后设置」= 只写 ui.onboarded，不动引擎（用户没选，就保留默认的 auto）
+  const skipped = normalizeSettings({ ui: { onboarded: true } })
+  check(
+    'N10',
+    '「稍后设置」路径只写 onboarded、不动引擎（保留默认 auto），向导可以正常关闭',
+    skipped.ui.onboarded === true && skipped.engine === 'auto',
+    `onboarded=${skipped.ui.onboarded} engine=${skipped.engine}`,
+  )
+}
+
+group('附加（v0.4.1）：设备检测修复（RTX 5070 Laptop 12GB + 16GB 内存）')
+{
+  // 本机实测：nvidia-smi 报 12231MiB，os.totalmem() 报 15.47GB
+  check(
+    'N11',
+    '12GB 显存 + 16GB 内存（实测 15.47GB）判为「可用」，不再说配置偏低',
+    tierOf(11.9, 15.47, {}) === 'good',
+    `tierOf(11.9, 15.47) = ${tierOf(11.9, 15.47, {})}`,
+  )
+  check(
+    'N12',
+    '内存阈值带 1GB 容差（Windows 会保留一部分内存，16GB 机器只报 15.4-15.9GB）',
+    tierOf(8, 15.47, {}) === 'good' && tierOf(8, 15, {}) === 'good' && tierOf(8, 14, {}) === 'marginal',
+    `15.47GB=${tierOf(8, 15.47, {})}，15GB=${tierOf(8, 15, {})}，14GB=${tierOf(8, 14, {})}`,
+  )
+  check(
+    'N13',
+    '检测不到显卡 → 「未检测到具体硬件信息」（unknown），不再直接判「不可用」恐吓用户',
+    tierOf(0, 32, {}) === 'unknown' && tierOf(0, 15.47, {}) === 'unknown',
+    `tierOf(0, 15.47) = ${tierOf(0, 15.47, {})}`,
+  )
+  check(
+    'N14',
+    '真的不达标仍然判「不可用」（4GB 显存 / 6GB 内存），不该被容差放过',
+    tierOf(4, 32, {}) === 'unusable' && tierOf(4, 6, {}) === 'unusable' && tierOf(12, 6, {}) === 'unusable',
+    `4G/32G=${tierOf(4, 32, {})}，4G/6G=${tierOf(4, 6, {})}，12G/6G=${tierOf(12, 6, {})}`,
+  )
+
+  check(
+    'N15',
+    'Ollama 已在跑且模型在 → 直接「可用」，不弹任何风险警告（即使硬件信息读不到）',
+    localRisk({ tier: 'unknown' }, { status: 'green' }) === 'none' &&
+      localRisk({ tier: 'marginal' }, { status: 'green' }) === 'none' &&
+      localRisk({ tier: 'good' }, { status: 'red' }) === 'none',
+    'green → none',
+  )
+  check(
+    'N16',
+    '风险档位：硬件未知只给软提示（不强制勾选），只有真不达标才硬拦',
+    localRisk({ tier: 'unknown' }, { status: 'red' }) === 'soft' &&
+      localRisk({ tier: 'marginal' }, { status: 'red' }) === 'soft' &&
+      localRisk({ tier: 'unusable' }, { status: 'red' }) === 'hard',
+    `unknown→${localRisk({ tier: 'unknown' }, { status: 'red' })}，marginal→${localRisk({ tier: 'marginal' }, { status: 'red' })}，unusable→${localRisk({ tier: 'unusable' }, { status: 'red' })}`,
+  )
+
+  // N17：手动填显存就按手填的算（读不到 GPU 的机器也能用本地）
+  const manual = await detectDevice({ force: true, thresholds: { manualVramGB: 12, manualGpuName: 'RTX 5070 Laptop' } })
+  check(
+    'N17',
+    '读不到显卡时，用户手填显存即可被采纳（决定权交还用户）',
+    manual.gpu && manual.gpu.vramTotalGB === 12 && manual.gpu.source === 'manual' && manual.tier !== 'unusable',
+    `gpu=${manual.gpu?.name}/${manual.gpu?.vramTotalGB}GB source=${manual.gpu?.source} tier=${manual.tier}`,
+  )
+  clearDeviceCache()
+
+  // N18：有独显时，内存闸门按显存放宽（12GB 显存 + 空闲 1.3GB 内存不该被拦）
+  {
+    const s = {
+      engine: 'ollama',
+      ollama: { baseUrl: OLLAMA_DEAD, model: 'qwen2.5:7b', timeoutMs: 500, minFreeMemoryGB: 100, maxConcurrency: 1, maxQueue: 5, breakerFailures: 3, breakerMinutes: 5 },
+      device: { enabled: false },
+    }
+    const withGpu = createOllamaGuard({ getSettings: () => s, getDevice: () => ({ gpu: { vramTotalGB: 11.9 } }) })
+    const withoutGpu = createOllamaGuard({ getSettings: () => s, getDevice: () => null })
+    check(
+      'N18',
+      '有独立显卡且显存够用时，系统内存闸门自动放宽（不再被空闲内存误伤）',
+      withGpu.check().ok === true && withoutGpu.check().ok === false,
+      `有显存=${withGpu.check().ok ? '放行' : '拦截'}，无显存=${withoutGpu.check().ok ? '放行' : '拦截'}`,
+    )
+  }
+}
+
+/* ================================================================== */
+/* 附加（v0.4.2）：浮窗拖动 / 原生卡片内嵌按钮 / 鲸鱼娘                    */
+/* ================================================================== */
+
+/** 极简假 DOM：只为验证「往原生卡片里插按钮」这段逻辑，不追求浏览器完备性。 */
+function installFakeDom({ drmActions = true, generic = false, insideOurs = false } = {}) {
+  const makeNode = (tag, className = '') => {
+    let text = ''
+    const el = {
+      tagName: String(tag).toUpperCase(),
+      className,
+      children: [],
+      parentNode: null,
+      attrs: {},
+      isConnected: true,
+      appendChild(child) {
+        if (child === null || child === undefined) return child
+        child.parentNode = el
+        el.children.push(child)
+        return child
+      },
+      insertBefore(child, ref) {
+        child.parentNode = el
+        const idx = ref ? el.children.indexOf(ref) : 0
+        el.children.splice(idx < 0 ? 0 : idx, 0, child)
+        return child
+      },
+      replaceChild(newNode, oldNode) {
+        const idx = el.children.indexOf(oldNode)
+        if (idx < 0) return oldNode
+        newNode.parentNode = el
+        el.children[idx] = newNode
+        return oldNode
+      },
+      replaceWith(newNode) {
+        const parent = el.parentNode
+        if (!parent) return
+        const idx = parent.children.indexOf(el)
+        if (idx < 0) return
+        newNode.parentNode = parent
+        parent.children[idx] = newNode
+      },
+      setAttribute(k, v) {
+        el.attrs[k] = String(v)
+      },
+      getAttribute(k) {
+        return Object.prototype.hasOwnProperty.call(el.attrs, k) ? el.attrs[k] : null
+      },
+      addEventListener(type, fn) {
+        if (type === 'error') el.onerror = fn
+      },
+      removeEventListener() {},
+      querySelector(sel) {
+        if (String(sel).includes('data-pap-inline-btn')) {
+          return el.children.find((c) => c && c.getAttribute && c.getAttribute('data-pap-inline-btn') === '1') || null
+        }
+        return null
+      },
+      querySelectorAll(sel) {
+        // 只为通用兜底选择器服务：`:scope > button, :scope > div > button`
+        if (String(sel).includes('button')) {
+          const direct = el.children.filter((c) => c && c.tagName === 'BUTTON')
+          const nested = el.children.flatMap((c) => (c && c.tagName === 'DIV' ? c.children.filter((x) => x && x.tagName === 'BUTTON') : []))
+          return [...direct, ...nested]
+        }
+        return []
+      },
+      closest() {
+        return insideOurs ? { tagName: 'DIV' } : null
+      },
+    }
+    // 真实 DOM 里 textContent 赋值会清空子节点，这里必须一致，否则「重绘按钮」测不出来
+    Object.defineProperty(el, 'textContent', {
+      get: () => text,
+      set: (v) => {
+        text = String(v)
+        el.children.length = 0
+      },
+    })
+    Object.defineProperty(el, 'parentElement', { get: () => el.parentNode })
+    el.classList = {
+      add: (c) => {
+        if (!el.className.split(/\s+/u).includes(c)) el.className = (el.className + ' ' + c).trim()
+      },
+      remove: (c) => {
+        el.className = el.className.split(/\s+/u).filter((x) => x && x !== c).join(' ')
+      },
+      toggle: (c, on) => {
+        const has = el.className.split(/\s+/u).includes(c)
+        const want = on === undefined ? !has : on
+        if (want && !has) el.className = (el.className + ' ' + c).trim()
+        if (!want && has) el.className = el.className.split(/\s+/u).filter((x) => x && x !== c).join(' ')
+      },
+      contains: (c) => el.className.split(/\s+/u).includes(c),
+    }
+    return el
+  }
+
+  const actionRow = drmActions ? makeNode('div', 'drm-actions') : null
+  const genericRow = makeNode('div', 'approval-actions')
+  const genericInner = makeNode('div')
+  genericInner.appendChild(makeNode('button'))
+  genericInner.appendChild(makeNode('button'))
+  genericRow.appendChild(genericInner)
+
+  const doc = {
+    body: makeNode('body'),
+    createElement: (tag) => makeNode(tag),
+    createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }),
+    querySelector: (sel) => (sel === '.drm-actions' ? actionRow : null),
+    querySelectorAll: (sel) => (sel === '[class*="approval"]' ? (generic ? [genericRow] : []) : []),
+  }
+  return { doc, actionRow, genericRow, genericInner }
+}
+
+group('附加（v0.4.2）：原生卡片内嵌「白话翻译」按钮')
+{
+  const client = loadClientModule().exports.__internal
+  const dom = installFakeDom({ drmActions: true })
+  const prevDoc = globalThis.document
+  globalThis.document = dom.doc
+  try {
+    client.overlayState.open = false
+    client.overlayState.collapsed = false
+    client.inlineState.button = null
+    client.inlineState.seen = false
+
+    check('P1', '能定位原生卡片的按钮行（.drm-actions，与 dsh-reject-message 源码一致）', client.findApprovalActionRow() === dom.actionRow, '命中 .drm-actions')
+
+    client.syncInlineButton()
+    const injected = dom.actionRow.children[0]
+    check(
+      'P2',
+      '「白话翻译」按钮被插在「拒绝 / 允许」旁边（按钮行第一位）',
+      dom.actionRow.children.length === 1 &&
+        injected &&
+        injected.className === 'pap_inlineBtn' &&
+        injected.getAttribute('data-pap-inline-btn') === '1' &&
+        dom.actionRow.getAttribute('data-pap-inline') === '1',
+      `按钮数=${dom.actionRow.children.length} class=${injected?.className}`,
+    )
+
+    client.syncInlineButton()
+    client.syncInlineButton()
+    check('P3', '重复同步不会插出重复按钮（React 重渲染后自动补回，而不是叠加）', dom.actionRow.children.length === 1, `按钮数=${dom.actionRow.children.length}`)
+
+    const labelOf = (btn) => btn.children.filter((c) => c && c.nodeType === 3).map((c) => c.textContent).join('')
+    client.toggleOverlay()
+    check(
+      'P4',
+      '点击后浮窗打开，按钮文案变成「收起翻译」',
+      client.overlayState.open === true && labelOf(injected) === '收起翻译',
+      `open=${client.overlayState.open} 文案=${labelOf(injected)}`,
+    )
+    check('P5', '按钮带鲸鱼娘图标（图标节点先于文字）', injected.children.length === 2, `子节点数=${injected.children.length}`)
+
+    client.toggleOverlay()
+    check('P6', '再点一次收起，按钮变回「白话翻译」', client.overlayState.open === false && labelOf(injected) === '白话翻译', `open=${client.overlayState.open} 文案=${labelOf(injected)}`)
+
+    // ---- v0.4.3 回归：v0.4.2 这里往 appendChild 塞了 React 元素，真实浏览器必然抛 ----
+    const icon = client.buildWhaleImage(18)
+    check(
+      'P9',
+      '按钮图标是真正的 DOM 节点（不是 React 元素）—— v0.4.2「空白按钮」的根因',
+      icon &&
+        icon.tagName === 'IMG' &&
+        icon.getAttribute('src') === client.WHALE_URL &&
+        typeof icon.onerror === 'function' &&
+        icon.$$typeof === undefined,
+      `tagName=${icon?.tagName} src=${icon?.getAttribute('src')} $$typeof=${String(icon?.$$typeof)}`,
+    )
+
+    // 图标加载失败也不能留空白框
+    let fallbackOk = false
+    try {
+      const brokenIcon = client.buildWhaleImage(18)
+      if (typeof brokenIcon.onerror === 'function') {
+        const holder = dom.doc.createElement('button')
+        holder.appendChild(brokenIcon)
+        brokenIcon.onerror()
+        fallbackOk = holder.children.length === 1 && holder.children[0].textContent === '🐋'
+      }
+    } catch (error) {
+      fallbackOk = false
+    }
+    check('P10', '头像加载失败时退化成 emoji，绝不留一个空白框', fallbackOk, 'onerror → 替换为 🐋')
+
+    // 绘制即使抛异常，也不会退化成「每次重新插一个」
+    const originalCreate = dom.doc.createElement
+    dom.doc.createElement = (tag) => {
+      if (tag === 'img') throw new Error('模拟创建图标失败')
+      return originalCreate(tag)
+    }
+    client.inlineState.button = null
+    client.syncInlineButton()
+    client.syncInlineButton()
+    client.syncInlineButton()
+    const countWithThrow = dom.actionRow.children.length
+    const btnWithThrow = dom.actionRow.children[0]
+    dom.doc.createElement = originalCreate
+    check(
+      'P11',
+      '绘制抛异常时：按钮仍然只有一个，且带兜底文字（不会插出一排空白框）',
+      countWithThrow === 1 && btnWithThrow && btnWithThrow.textContent === '白话翻译',
+      `按钮数=${countWithThrow} 文字="${btnWithThrow?.textContent}"`,
+    )
+    client.inlineState.paintError = null
+    client.syncInlineButton()
+    check('P12', '异常恢复后能重新画出图标+文字', client.inlineState.paintError === null && dom.actionRow.children[0].children.length === 2, `子节点=${dom.actionRow.children[0].children.length}`)
+  } finally {
+    if (prevDoc === undefined) delete globalThis.document
+    else globalThis.document = prevDoc
+  }
+
+  {
+    const dom2 = installFakeDom({ drmActions: false, generic: true })
+    const prevDoc = globalThis.document
+    globalThis.document = dom2.doc
+    try {
+      check('P7', '其它审批面板也能兜底定位（class 含 approval 且含 ≥2 个按钮）', client.findApprovalActionRow() === dom2.genericInner, '命中通用兜底容器')
+    } finally {
+      if (prevDoc === undefined) delete globalThis.document
+      else globalThis.document = prevDoc
+    }
+  }
+
+  {
+    const dom3 = installFakeDom({ drmActions: false, generic: true, insideOurs: true })
+    const prevDoc = globalThis.document
+    globalThis.document = dom3.doc
+    try {
+      check('P8', '不会误伤自己的浮窗（排除 data-plain-approval 内部）', client.findApprovalActionRow() === null, 'closest 命中自己的容器 → 跳过')
+    } finally {
+      if (prevDoc === undefined) delete globalThis.document
+      else globalThis.document = prevDoc
+    }
+  }
+}
+
+group('附加（v0.4.2）：浮窗拖动 / 位置记忆 / 重置')
+{
+  const mod = loadClientModule()
+  const client = mod.exports.__internal
+  // 视口尺寸在 client 模块内部读的是注入给它的那个 `window`，不是 globalThis.window
+  mod.window.innerWidth = 1000
+  mod.window.innerHeight = 800
+
+  const prevStorage = globalThis.localStorage
+  const store = new Map()
+  globalThis.localStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: (k) => store.delete(k),
+  }
+  try {
+    const c = client.clampChipPos({ x: 5000, y: 5000 }, 300, 200)
+    check('W1', '拖出屏幕的坐标会被拉回可视区域', c.x <= 1000 - 300 && c.y <= 800 - 200 && c.x >= 4 && c.y >= 4, JSON.stringify(c))
+
+    client.saveChipPos({ x: 137, y: 246 }, { w: 320, h: 180 })
+    const restored = client.loadChipPos()
+    check('W2', '拖动后的位置会被记住，下次打开沿用同一位置', restored && restored.x === 137 && restored.y === 246, JSON.stringify(restored))
+
+    client.saveChipPos(null, null)
+    check('W3', '「重置位置」清掉记录，回到右下角默认位置', client.loadChipPos() === null, `loadChipPos=${JSON.stringify(client.loadChipPos())}`)
+
+    store.set('plain-approval.chipPos', JSON.stringify({ x: 99999, y: 99999, w: 300, h: 200 }))
+    const clamped = client.loadChipPos()
+    check('W4', '换分辨率后旧位置会被夹回可视范围（不会跑到屏幕外）', clamped && clamped.x <= 1000 - 300 && clamped.y <= 800 - 200, JSON.stringify(clamped))
+  } finally {
+    if (prevStorage === undefined) delete globalThis.localStorage
+    else globalThis.localStorage = prevStorage
+  }
+
+  check(
+    'W5',
+    '鲸鱼娘头像走插件自己的本地路由，不是外部链接',
+    /^\/api\/plain-approval\/asset\//u.test(client.WHALE_URL) && !/^https?:/u.test(client.WHALE_URL),
+    `WHALE_URL=${client.WHALE_URL}`,
+  )
+
+  // v0.4.3：设置页的「重置翻译浮窗位置」通过指令总线通知活着的浮窗
+  {
+    const received = []
+    const handler = (action) => received.push(action)
+    client.chipCommands.add(handler)
+    client.emitChipCommand('reset')
+    client.chipCommands.delete(handler)
+    check('W7', '设置页「重置翻译浮窗位置」能通知到活着的浮窗（指令总线）', received.length === 1 && received[0] === 'reset', `收到指令=${JSON.stringify(received)}`)
+  }
+
+  // 打开浮窗时先广播 reclamp：位置丢了也能让浮窗自己夹回可视区
+  {
+    const received = []
+    const handler = (action) => received.push(action)
+    client.chipCommands.add(handler)
+    client.overlayState.open = false
+    client.toggleOverlay()
+    client.chipCommands.delete(handler)
+    check(
+      'W8',
+      '点「白话翻译」打开浮窗时先请求 reclamp（浮窗丢失兜底）',
+      received.includes('reclamp') && client.overlayState.open === true,
+      `指令=${JSON.stringify(received)} open=${client.overlayState.open}`,
+    )
+    client.overlayState.open = false
+  }
+
+  // 非浏览器环境（拿不到视口）不能产出 NaN 坐标
+  mod.window.innerWidth = undefined
+  mod.window.innerHeight = undefined
+  const noViewport = client.clampChipPos({ x: 42, y: 24 }, 300, 200)
+  check('W6', '拿不到视口尺寸时原样返回坐标，绝不产出 NaN', noViewport.x === 42 && noViewport.y === 24, JSON.stringify(noViewport))
+  mod.window.innerWidth = 1000
+  mod.window.innerHeight = 800
+}
+
+group('附加（v0.4.2）：鲸鱼娘头像资源（本地，不依赖外链）')
+{
+  const home = mkdtempSync(join(TMP_ROOT, 'asset-'))
+  const prevHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  let route = null
+  const fakeCtx = {
+    logger: { info() {}, warn() {}, error() {}, debug() {} },
+    get: () => undefined,
+    on: () => () => {},
+    effect: (fn) => {
+      const dispose = fn()
+      return typeof dispose === 'function' ? dispose : () => {}
+    },
+    inject: (names, cb) => cb({ effect: (fn) => fn(), webServer: { register(r) { route = r; return () => {} } } }),
+  }
+  applyHost(fakeCtx, { engine: 'auto', ollama: { baseUrl: OLLAMA_DEAD, model: 'qwen2.5:7b', timeoutMs: 500, minFreeMemoryGB: 0 }, log: { enabled: true }, cache: { enabled: false, driver: 'json' } })
+
+  const server = createHttpServer((req, res) => route.handler(req, res))
+  await new Promise((r) => server.listen(0, '127.0.0.1', r))
+  const base = `http://127.0.0.1:${server.address().port}`
+
+  // <img src> 带不了自定义头，所以资源路由必须不要求 x-plain-approval
+  const svgRes = await fetch(base + API_BASE + 'asset/whale-girl.svg')
+  const svgText = await svgRes.text()
+  check(
+    'A1',
+    '头像能被 <img> 直接取到（不要求自定义请求头），Content-Type 是 svg',
+    svgRes.status === 200 && /image\/svg\+xml/u.test(String(svgRes.headers.get('content-type'))) && svgText.includes('<svg'),
+    `HTTP ${svgRes.status} ${svgRes.headers.get('content-type')} 字节数=${svgText.length}`,
+  )
+  check(
+    'A2',
+    '头像是本地资源、24x24 可缩放、且带 CC BY-NC-SA 署名注释',
+    svgText.includes('viewBox="0 0 24 24"') && /CC BY-NC-SA/u.test(svgText) && /上善无形/u.test(svgText),
+    '含 viewBox 24 与署名注释',
+  )
+
+  const traversal = await fetch(base + API_BASE + 'asset/..%2F..%2Fpackage.json')
+  check('A3', '路径穿越被拒绝（文件名白名单）', traversal.status === 404 || traversal.status === 400, `HTTP ${traversal.status}`)
+
+  const missing = await fetch(base + API_BASE + 'asset/nope.svg')
+  check('A4', '不存在的资源返回 404，不会抛异常', missing.status === 404, `HTTP ${missing.status}`)
+
+  await new Promise((r) => server.close(r))
+  process.env.DSH_HOME = prevHome
+  try {
+    rmSync(home, { recursive: true, force: true })
+  } catch (error) {
+    /* ignore */
+  }
+}
+
+/* ================================================================== */
+
+group('结果汇总')
+const passed = results.filter((r) => r.ok).length
+const failed = results.filter((r) => !r.ok)
+console.log(`\n共 ${results.length} 项：通过 ${passed}，失败 ${failed.length}`)
+for (const f of failed) console.log(`  FAIL ${f.id} ${f.name} — ${f.detail}`)
+process.exit(failed.length === 0 ? 0 : 1)

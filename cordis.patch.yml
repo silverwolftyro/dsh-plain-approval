@@ -1,0 +1,11 @@
+# dsh-plain-approval —— 说人话
+#
+# 本 patch 只做一件事：把宿主半边插件插进当前 profile。
+# 客户端半边由 package.json 的 dsh.client 段声明，无需在此登记。
+- insert:
+    - id: plain-approval
+      name: dsh-plain-approval
+      config:
+        # 所有字段都可以留空，插件会使用内置默认值；
+        # 也可以在 DSH 设置页「说人话」里改（写入用户数据目录，优先级更高）。
+        engine: auto

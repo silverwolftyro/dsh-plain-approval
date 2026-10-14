@@ -1,0 +1,5 @@
+{"t":"2026-10-14T01:01:48.263Z","level":"info","event":"host.loaded","version":"0.5.0-stable","engine":"deepseek","cache":"sqlite","slotMode":"takeover","workspace":"d:\\dsh-speak-human工作区\\dsh-plain-approval","grants":0}
+{"t":"2026-10-14T01:01:48.263Z","level":"info","event":"http.registered","prefix":"/api/plain-approval"}
+{"t":"2026-10-14T01:01:48.276Z","level":"info","event":"approval.seen","hash":"1de700c29687cae3","risk":"安全","tool":"pwsh","localOnly":false,"tempCleanup":false,"commandMissing":false,"context":"yes","slotMode":"takeover","commandHash":"1de700c29687cae3","commandChars":6,"callId":"call-1"}
+{"t":"2026-10-14T01:01:48.398Z","level":"warn","event":"translate.channel-failed","channel":"http","code":"network","reason":"DeepSeek 网络异常：fetch failed"}
+{"t":"2026-10-14T01:01:48.399Z","level":"error","event":"translate.failure","hash":"1de700c29687cae3","engine":"deepseek","code":"all-unavailable","message":"DeepSeek API：DeepSeek 网络异常：fetch failed","ms":134}

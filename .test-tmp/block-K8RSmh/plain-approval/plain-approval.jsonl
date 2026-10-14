@@ -1,0 +1,6 @@
+{"t":"2026-10-14T02:15:00.120Z","level":"info","event":"host.loaded","version":"0.5.1","engine":"deepseek","cache":"sqlite","slotMode":"takeover","workspace":"d:\\dsh-speak-human工作区\\dsh-plain-approval","grants":0}
+{"t":"2026-10-14T02:15:00.120Z","level":"info","event":"probe.userQuestions","available":false,"methods":"","singularAvailable":false,"note":"ctx.get('userQuestions') 不可用 —— 冲突提示将降级为自绘"}
+{"t":"2026-10-14T02:15:00.121Z","level":"info","event":"http.registered","prefix":"/api/plain-approval"}
+{"t":"2026-10-14T02:15:00.131Z","level":"info","event":"approval.seen","hash":"1de700c29687cae3","risk":"安全","tool":"pwsh","localOnly":false,"tempCleanup":false,"commandMissing":false,"context":"yes","slotMode":"takeover","commandHash":"1de700c29687cae3","commandChars":6,"callId":"call-1"}
+{"t":"2026-10-14T02:15:00.260Z","level":"warn","event":"translate.channel-failed","channel":"http","code":"network","reason":"DeepSeek 网络异常：fetch failed"}
+{"t":"2026-10-14T02:15:00.260Z","level":"error","event":"translate.failure","hash":"1de700c29687cae3","engine":"deepseek","code":"all-unavailable","message":"DeepSeek API：DeepSeek 网络异常：fetch failed","ms":138}

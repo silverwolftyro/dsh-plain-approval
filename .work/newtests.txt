@@ -1,0 +1,350 @@
+/* ================================================================== */
+/* 附加（v0.4.5）：卡死根因回归 —— 源码红线                                */
+/* ================================================================== */
+
+group('附加（v0.4.5）：卡死根因回归（源码红线，绝不允许再犯）')
+{
+  const clientSource = readFileSync(join(HERE_SRC, 'client.js'), 'utf8')
+
+  check(
+    'X1',
+    '客户端里没有 MutationObserver / observe()：v0.4.2 卡死 + 内存爆满的根因',
+    !/new\s+MutationObserver\s*\(/u.test(clientSource) && !/\.observe\s*\(/u.test(clientSource),
+    '全文件搜不到 new MutationObserver / .observe(',
+  )
+  check(
+    'X2',
+    '客户端不注册任何 window 级事件监听（浮窗拖动功能已彻底删除）',
+    !/window\.addEventListener/u.test(clientSource),
+    '搜不到 window.addEventListener',
+  )
+  check('X3', '客户端不注册任何 document 级事件监听', !/document\.addEventListener/u.test(clientSource), '搜不到 document.addEventListener')
+  check('X4', '客户端不再使用 localStorage（浮窗位置固定，没有位置状态）', !/localStorage\.(getItem|setItem|removeItem)/u.test(clientSource), '搜不到 localStorage 读写')
+
+  const bodyAppends = [...clientSource.matchAll(/document\.body\.appendChild\(/gu)].length
+  check('X5', '直接往 body 插节点只出现在受控位置（复制 1 处 + 下载 2 处）', bodyAppends === 3, 'document.body.appendChild 出现 ' + bodyAppends + ' 次')
+  check(
+    'X6',
+    '每处 appendChild 之后都会立刻移除，不会越积越多',
+    /appendChild\(area\)[\s\S]{0,160}?area\.remove\(\)/u.test(clientSource) && /appendChild\(anchor\)[\s\S]{0,160}?anchor\.remove\(\)/u.test(clientSource),
+    'textarea / a 元素用完即 remove()',
+  )
+  check('X7', '样式只注入一次（有幂等守卫）且在插件卸载时移除', /style\[data-plugin-css=/u.test(clientSource) && /tag\.remove\(\)/u.test(clientSource), '有 querySelector 守卫 + tag.remove() 清理')
+  check(
+    'X8',
+    '浮窗位置完全由 CSS 固定（没有拖拽指针事件、没有内联定位）',
+    !/onPointerDown/u.test(clientSource) && !/setPointerCapture/u.test(clientSource) && /'\.pap_chipRoot\{position:fixed/u.test(clientSource),
+    '没有 onPointerDown/setPointerCapture，浮窗用 position:fixed',
+  )
+}
+
+/* ================================================================== */
+/* 附加（v0.4.5）：完整渲染生命周期（挂载 → 交互 → 卸载）                  */
+/* ================================================================== */
+
+/** 记录全局副作用的最小 React hooks 运行时。 */
+function mountLifecycle() {
+  const calls = { intervals: [], cleared: [], observers: [] }
+  const listeners = []
+  const saved = {}
+
+  const install = () => {
+    saved.MutationObserver = globalThis.MutationObserver
+    globalThis.MutationObserver = class {
+      constructor() {
+        calls.observers.push(true)
+        throw new Error('不允许创建 MutationObserver')
+      }
+    }
+    saved.setInterval = globalThis.setInterval
+    saved.clearInterval = globalThis.clearInterval
+    globalThis.setInterval = (fn, ms) => {
+      const id = { fn, ms }
+      calls.intervals.push(id)
+      return id
+    }
+    globalThis.clearInterval = (id) => calls.cleared.push(id)
+    saved.localStorage = globalThis.localStorage
+    globalThis.localStorage = {
+      getItem: () => {
+        throw new Error('不允许读 localStorage')
+      },
+      setItem: () => {
+        throw new Error('不允许写 localStorage')
+      },
+      removeItem: () => {
+        throw new Error('不允许删 localStorage')
+      },
+    }
+  }
+  const restore = () => {
+    globalThis.MutationObserver = saved.MutationObserver
+    globalThis.setInterval = saved.setInterval
+    globalThis.clearInterval = saved.clearInterval
+    globalThis.localStorage = saved.localStorage
+  }
+
+  function createRuntime() {
+    const store = { hooks: [], cursor: 0, effects: [], dirty: false }
+    const api = {
+      createElement: (type, props, ...children) => ({ type, props: props || {}, children }),
+      Fragment: 'fragment',
+      Component: class {
+        constructor(props) {
+          this.props = props
+          this.state = {}
+        }
+        setState(next) {
+          this.state = { ...this.state, ...(typeof next === 'function' ? next(this.state) : next) }
+        }
+      },
+      useState(init) {
+        const i = store.cursor++
+        if (!(i in store.hooks)) store.hooks[i] = { v: typeof init === 'function' ? init() : init }
+        const set = (next) => {
+          store.hooks[i].v = typeof next === 'function' ? next(store.hooks[i].v) : next
+          store.dirty = true
+        }
+        return [store.hooks[i].v, set]
+      },
+      useRef(init) {
+        const i = store.cursor++
+        if (!(i in store.hooks)) store.hooks[i] = { v: { current: init } }
+        return store.hooks[i].v
+      },
+      useEffect(fn, deps) {
+        const i = store.cursor++
+        const prev = store.hooks[i]
+        const changed = !prev || !prev.deps || !deps || deps.some((d, k) => d !== prev.deps[k])
+        const entry = prev || { cleanup: null, ran: false }
+        entry.fn = fn
+        entry.deps = deps
+        entry.changed = changed
+        store.hooks[i] = entry
+        store.effects.push(entry)
+      },
+      useCallback(fn) {
+        return fn
+      },
+      useMemo(fn) {
+        return fn()
+      },
+    }
+    return { api, store }
+  }
+
+  function mount(Component, props) {
+    const { api, store } = createRuntime()
+    let tree = null
+    const render = () => {
+      store.cursor = 0
+      store.effects = []
+      tree = Component(props)
+      for (const effect of store.effects) {
+        if (effect.changed || !effect.ran) {
+          if (typeof effect.cleanup === 'function') effect.cleanup()
+          effect.cleanup = null
+          const ret = effect.fn()
+          effect.cleanup = typeof ret === 'function' ? ret : null
+          effect.ran = true
+        }
+      }
+    }
+    render()
+    return {
+      api,
+      get tree() {
+        return tree
+      },
+      rerender() {
+        if (!store.dirty) return
+        store.dirty = false
+        render()
+      },
+      unmount() {
+        for (const effect of store.effects) {
+          if (typeof effect.cleanup === 'function') effect.cleanup()
+          effect.cleanup = null
+          effect.ran = false
+        }
+      },
+    }
+  }
+
+  return { calls, listeners, install, restore, mount }
+}
+
+group('附加（v0.4.5）：完整渲染生命周期（挂载 → 交互 → 卸载）')
+{
+  const mod = loadClientModule()
+  const client = mod.exports.__internal
+  const life = mountLifecycle()
+
+  const prevFetch = globalThis.fetch
+  const prevDoc = globalThis.document
+  const prevWin = globalThis.window
+
+  life.install()
+  globalThis.window = {
+    addEventListener: (type, fn) => life.listeners.push({ type, fn, target: 'window' }),
+    removeEventListener: (type, fn) => {
+      const i = life.listeners.findIndex((l) => l.type === type && l.fn === fn)
+      if (i >= 0) life.listeners.splice(i, 1)
+    },
+    innerWidth: 1280,
+    innerHeight: 800,
+  }
+  globalThis.document = {
+    hidden: false,
+    addEventListener: (type, fn) => life.listeners.push({ type, fn, target: 'document' }),
+    removeEventListener: () => {},
+  }
+
+  const pendingPayload = {
+    ok: true,
+    data: {
+      items: [
+        {
+          key: 'k1',
+          command: 'ls -la',
+          toolName: 'pwsh',
+          reason: 'escalate x',
+          quick: {
+            status: 'pending',
+            headline: '正在翻译…',
+            sections: {
+              background: '未读取到会话上下文，仅翻译命令本身。',
+              what: '查看当前文件夹里的文件',
+              touch: '当前目录',
+              mode: '只读',
+              risk: '安全',
+              advice: '可以允许',
+              consequence: '不会改动任何文件。',
+              benefit: '让你看到有哪些文件。',
+              parts: [],
+            },
+            notes: [],
+            text: { zh: '【白话审批】', en: '' },
+          },
+        },
+      ],
+    },
+  }
+  let fetchCalls = 0
+  globalThis.fetch = async () => {
+    fetchCalls += 1
+    return { ok: true, status: 200, text: async () => JSON.stringify(pendingPayload) }
+  }
+
+  client.uiPrefs.loaded = true
+  client.uiPrefs.onboarded = true
+  client.uiPrefs.slotPolicy = 'auto'
+  client.slotDecision.yielding = true
+  client.slotDecision.rivals = ['dsh-reject-message']
+
+  const findButton = (node, label) => {
+    if (!node || typeof node !== 'object') return null
+    if (node.type === 'button' && Array.isArray(node.children) && node.children.includes(label)) return node
+    for (const child of node.children || []) {
+      const hit = findButton(child, label)
+      if (hit) return hit
+    }
+    return null
+  }
+
+  let mounted = null
+  try {
+    mounted = life.mount(mod.exports.ReviewChipEntry, { t: (k) => k, locale: 'zh' })
+    await new Promise((r) => setTimeout(r, 10))
+
+    check(
+      'L1',
+      '挂载后只创建一个 2 秒轮询定时器，且不创建任何 MutationObserver',
+      life.calls.intervals.length === 1 && life.calls.intervals[0].ms === 2000 && life.calls.observers.length === 0,
+      '定时器 ' + life.calls.intervals.length + ' 个（' + life.calls.intervals[0]?.ms + 'ms），观察者 ' + life.calls.observers.length + ' 个',
+    )
+    check('L2', '挂载过程不在 window / document 上加任何事件监听器', life.listeners.length === 0, '全局监听器 ' + life.listeners.length + ' 个')
+    check('L3', '挂载后会去拉一次挂起列表（数据源），没有其他副作用', fetchCalls >= 1, 'fetch 调用 ' + fetchCalls + ' 次')
+
+    const expandBtn = findButton(mounted.tree, 'chipShow')
+    if (expandBtn && expandBtn.props && typeof expandBtn.props.onClick === 'function') {
+      expandBtn.props.onClick()
+      mounted.rerender()
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    check(
+      'L4',
+      '点击交互后不新增定时器、不新增全局监听器（没有副作用累积）',
+      life.calls.intervals.length === 1 && life.listeners.length === 0,
+      '定时器 ' + life.calls.intervals.length + ' 个，监听器 ' + life.listeners.length + ' 个',
+    )
+
+    mounted.unmount()
+    await new Promise((r) => setTimeout(r, 5))
+    check(
+      'L5',
+      '卸载后 2 秒轮询被 clearInterval 清掉（无定时器泄漏）',
+      life.calls.cleared.length === 1 && life.calls.cleared[0] === life.calls.intervals[0],
+      '清掉的定时器 ' + life.calls.cleared.length + ' 个',
+    )
+    check('L6', '整轮生命周期结束后，window / document 上没有残留监听器（无泄漏）', life.listeners.length === 0, '残留监听器 ' + life.listeners.length + ' 个')
+
+    const second = life.mount(mod.exports.ReviewChipEntry, { t: (k) => k, locale: 'zh' })
+    await new Promise((r) => setTimeout(r, 10))
+    second.unmount()
+    check(
+      'L7',
+      '重复挂载/卸载不累积定时器与监听器（每次都是干净的一进一出）',
+      life.calls.intervals.length === 2 && life.calls.cleared.length === 2 && life.listeners.length === 0,
+      '累计定时器 ' + life.calls.intervals.length + '，累计清理 ' + life.calls.cleared.length + '，监听器 ' + life.listeners.length,
+    )
+  } finally {
+    try {
+      if (mounted) mounted.unmount()
+    } catch (ignored) {
+      /* ignore */
+    }
+    life.restore()
+    globalThis.fetch = prevFetch
+    if (prevDoc === undefined) delete globalThis.document
+    else globalThis.document = prevDoc
+    if (prevWin === undefined) delete globalThis.window
+    else globalThis.window = prevWin
+  }
+}
+
+group('附加（v0.4.5）：渲染异常兜底（ErrorBoundary）')
+{
+  const mod = loadClientModule()
+  const PluginBoundary = mod.exports.PluginBoundary
+  const clientSource = readFileSync(join(HERE_SRC, 'client.js'), 'utf8')
+
+  check('B1', '客户端导出了通用渲染兜底组件 PluginBoundary', typeof PluginBoundary === 'function', typeof PluginBoundary)
+
+  const state = PluginBoundary.getDerivedStateFromError()
+  check('B2', '捕获到渲染异常后进入 failed 状态（不会继续渲染坏子树）', state && state.failed === true, JSON.stringify(state))
+
+  const inst = new PluginBoundary({ text: '白话翻译暂不可用（测试）' })
+  inst.state = { failed: true }
+  const rendered = inst.render()
+  check(
+    'B3',
+    '降级渲染为一行「暂不可用」提示，而不是白屏或让整个界面崩',
+    rendered && rendered.type === 'div' && String(rendered.props.className).includes('pap_boundaryFallback') && String(rendered.children).includes('暂不可用'),
+    JSON.stringify(rendered && rendered.children),
+  )
+
+  const silent = new PluginBoundary({ text: 'x', silent: true })
+  silent.state = { failed: true }
+  check('B4', '浮窗以外的地方可以选择静默降级（返回 null）', silent.render() === null, 'silent=true → null')
+
+  check(
+    'B5',
+    '三处 UI 入口（卡片 / 浮窗 / 设置页）都包了兜底组件',
+    /function ComposerEntry[\s\S]{0,400}?PluginBoundary/u.test(clientSource) &&
+      /function SettingsEntry[\s\S]{0,200}?PluginBoundary/u.test(clientSource) &&
+      /function ChipBoundary[\s\S]{0,300}?PluginBoundary/u.test(clientSource),
+    'ComposerEntry / SettingsEntry / ChipBoundary 都用了 PluginBoundary',
+  )
+}
+

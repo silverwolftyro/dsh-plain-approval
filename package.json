@@ -1,0 +1,58 @@
+{
+  "name": "dsh-plain-approval",
+  "version": "0.6.1",
+  "description": "说人话 —— 让每一条提权命令，都先说人话。DSH 审批卡片「意图」解释插件。v0.6.0 引入分析深度分层；v0.6.1 把默认改为「一律 L2」——识别正确度是核心诉求，最准的那档作默认，省钱档留给用户自选。",
+  "type": "module",
+  "license": "MIT",
+  "author": "dsh-plain-approval contributors",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "approval",
+    "permission",
+    "ollama",
+    "plain-language",
+    "chinese"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "src",
+    "assets",
+    "locale",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md",
+    "CHANGELOG.md",
+    "修复说明-v0.4.6-safe.md",
+    "升级指南-v0.5.0-stable.md",
+    "发布清单-v0.5.1.md",
+    "NOTICE",
+    "SECURITY.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "icon": "./icon.svg",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-approval"
+      ]
+    }
+  }
+}

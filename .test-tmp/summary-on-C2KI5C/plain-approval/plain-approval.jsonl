@@ -1,0 +1,3 @@
+{"t":"2026-10-14T02:13:33.711Z","level":"warn","event":"translate.channel-failed","channel":"ollama","code":"unreachable","reason":"连不上 Ollama（http://127.0.0.1:1），可能未安装或未启动"}
+{"t":"2026-10-14T02:13:33.712Z","level":"error","event":"translate.failure","hash":"1de700c29687cae3","engine":"ollama","code":"all-unavailable","message":"本地 Ollama：连不上 Ollama（http://127.0.0.1:1），可能未安装或未启动","ms":7}
+{"t":"2026-10-14T02:13:33.713Z","level":"warn","event":"ollama.fail-streak","streak":1}

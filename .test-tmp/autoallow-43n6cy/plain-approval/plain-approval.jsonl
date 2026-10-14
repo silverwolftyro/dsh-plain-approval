@@ -1,0 +1,6 @@
+{"t":"2026-10-14T06:37:12.564Z","level":"warn","event":"translate.channel-failed","channel":"ollama","code":"unreachable","reason":"连不上 Ollama（http://127.0.0.1:1），可能未安装或未启动"}
+{"t":"2026-10-14T06:37:12.566Z","level":"error","event":"translate.failure","hash":"d3f647232744627c","engine":"ollama","code":"all-unavailable","message":"本地 Ollama：连不上 Ollama（http://127.0.0.1:1），可能未安装或未启动","ms":22}
+{"t":"2026-10-14T06:37:12.567Z","level":"warn","event":"ollama.fail-streak","streak":1}
+{"t":"2026-10-14T06:37:12.568Z","level":"warn","event":"translate.channel-failed","channel":"ollama","code":"unreachable","reason":"连不上 Ollama（http://127.0.0.1:1），可能未安装或未启动"}
+{"t":"2026-10-14T06:37:12.569Z","level":"error","event":"translate.failure","hash":"cd990059f5239760","engine":"ollama","code":"all-unavailable","message":"本地 Ollama：连不上 Ollama（http://127.0.0.1:1），可能未安装或未启动","ms":21}
+{"t":"2026-10-14T06:37:12.570Z","level":"warn","event":"ollama.fail-streak","streak":2}
