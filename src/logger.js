@@ -99,7 +99,10 @@ function sanitize(details) {
       out[key + 'Hash'] = shortHash(value)
       continue
     }
-    if (typeof value === 'string') out[key] = oneLine(value, 300)
+    // stack / componentStack 是 React 渲染异常的命根子：截到 300 字符就只剩
+    // "TypeError: Cannot read properties of undefined"，没有出错的组件栈，
+    // 等于白记。这两个 key 放宽到 4000，其余字段维持 300 不变。
+    if (typeof value === 'string') out[key] = oneLine(value, (key === 'stack' || key === 'componentStack') ? 4000 : 300)
     else if (value === null || typeof value === 'number' || typeof value === 'boolean') out[key] = value
     else out[key] = oneLine(JSON.stringify(value), 300)
   }

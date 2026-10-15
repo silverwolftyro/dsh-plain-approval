@@ -1794,7 +1794,7 @@ group('附加（v0.4）：上下文感知翻译')
     promptNoCtx.includes('未读取到会话上下文') && promptNoCtx.includes('必须原样写'),
     '提示词含「未读取到会话上下文」+「必须原样写」',
   )
-  check('C4', '有上下文时把上下文交给模型，并要求据此写 intent', promptWithCtx.includes('测试一下审批弹窗') && promptWithCtx.includes('intent'), '提示词含真实上下文 + 指向 intent')
+  check('C4', '有上下文时把上下文交给模型，并要求据此写 title/why', promptWithCtx.includes('测试一下审批弹窗') && promptWithCtx.includes('title'), '提示词含真实上下文 + 指向 title')
 
   const parsedNoBg = parseSevenSection('{"what":"看看文件","touch":"当前目录","mode":"只读","risk":"安全","advice":"可以允许","consequence":"不改动。","benefit":"看到文件。","parts":[]}')
   check('C5', '模型没给「背景」时不编造（background 保持 undefined）', parsedNoBg.ok === true && parsedNoBg.value.background === undefined, `background=${JSON.stringify(parsedNoBg.value.background)}`)
@@ -1923,9 +1923,9 @@ group('附加（v0.4）：排版去重')
     const pendingItem = (pendingBody.data.items || []).find((it) => it.command === 'ls -la') || (pendingBody.data.items || [])[0]
     check(
       'Y1c',
-      '原始命令与完整七段从 /pending 照常可取（卡片/浮窗的数据源不依赖 displayReason）',
-      !!pendingItem && pendingItem.command === 'ls -la' && !!pendingItem.quick?.sections?.intent && String(pendingItem.quick.text.zh).includes('1. 意图'),
-      `命令=${pendingItem?.command} 意图=${pendingItem?.quick?.sections?.intent}`,
+      '原始命令与完整结构从 /pending 照常可取（卡片/浮窗的数据源不依赖 displayReason）',
+      !!pendingItem && pendingItem.command === 'ls -la' && !!pendingItem.quick?.sections?.title && String(pendingItem.quick.text.zh).includes('1. 在干什么'),
+      `命令=${pendingItem?.command} 标题=${pendingItem?.quick?.sections?.title}`,
     )
     await releaseYield('rejected')
     await yieldNext
@@ -3063,40 +3063,41 @@ group('附加（v0.5.5）：意图翻译（「翻译官」→「理解官」）'
   // ---- 结构：七段的第一段是意图，背景/干什么不再单列 ----
   {
     const s = normalizeSections({ intent: '帮你补全 ComfyUI 缺的画图模型', touch: 'checkpoints 和 loras 目录', mode: '写入', risk: '安全', advice: '可以允许', consequence: '最坏是占满磁盘。', benefit: '让 ComfyUI 能正常出图。', parts: [] })
-    check('I1', '★ 七段结构里 intent 是第一段', Object.keys(s)[0] === 'intent' && !('background' in s), Object.keys(s).join(','))
-    check('I2', '「干什么」不再是独立段落', !('what' in s) && !('background' in s), '无 what / background 字段')
-    check('I3', '★ 意图长度限制在 60 个汉字', 'x'.repeat(200).length === 200 && normalizeSections({ intent: 'y'.repeat(200), risk: '安全' }).intent.length === 60, normalizeSections({ intent: 'y'.repeat(200), risk: '安全' }).intent.length + ' 字符')
+    const clientSrc = readFileSync(join(HERE_SRC, 'client.js'), 'utf8')
+    check('I1', '★ v0.7.0 第一段是 title（卡片顶行）', Object.keys(s)[0] === 'title' && !('background' in s), Object.keys(s).join(','))
+    check('I2', '★ 界面上不再有独立的「干什么」段落（what 仅作旧客户端兼容保留，不进折叠区）', !('background' in s) && /const SECTION_KEYS = \['why', 'touch', 'outcome'\]/u.test(clientSrc), '折叠区只含 why/touch/outcome')
+    check('I3', '★ 标题长度限制在 60 个汉字（硬上限兜底，防止顶行撑爆）', 'x'.repeat(200).length === 200 && normalizeSections({ title: 'y'.repeat(200), risk: '安全' }).title.length === 60, normalizeSections({ title: 'y'.repeat(200), risk: '安全' }).title.length + ' 字符')
   }
 
   // ---- 兼容性：老模型只吐 background / what，不能变成「未识别」 ----
   {
     const old = normalizeSections({ what: '查看当前目录的文件', touch: '当前目录', mode: '只读', risk: '安全', advice: '可以允许', consequence: '不改动。', benefit: '看到文件。', parts: [] })
-    check('I4', '★ 老格式的 what 会被折叠进 intent（不丢内容）', old.intent === '查看当前目录的文件', old.intent)
+    check('I4', '★ 老格式的 what 会被折叠进 title（不丢内容）', old.title === '查看当前目录的文件' && old.what === '查看当前目录的文件', old.title)
     const old2 = normalizeSections({ background: '你刚才让它测试弹窗', touch: '桌面', mode: '写入', risk: '安全', advice: '可以允许', consequence: '多一个文件。', benefit: '看到弹窗。', parts: [] })
-    check('I5', '★ 老格式的 background 也会折叠进 intent', old2.intent === '你刚才让它测试弹窗', old2.intent)
-    check('I6', '中文字段名（意图/目的）同样认', normalizeSections({ 意图: '帮你下载模型', risk: '安全' }).intent === '帮你下载模型', normalizeSections({ 意图: '帮你下载模型', risk: '安全' }).intent)
+    check('I5', '★ 老格式的 background 也会折叠进 title', old2.title === '你刚才让它测试弹窗', old2.title)
+    check('I6', '中文字段名（意图/目的/标题）同样认', normalizeSections({ 意图: '帮你下载模型', risk: '安全' }).title === '帮你下载模型' && normalizeSections({ 标题: '检查目录', risk: '安全' }).title === '检查目录', '中文别名可解析')
   }
 
   // ---- 提示词：反例必须真的在里面 ----
   {
     const sys = SYSTEM_PROMPT
-    check('I7', '★ 提示词明说「不是逐字翻译，而是回答 AI 想干什么」', /不是逐字翻译/u.test(sys) && /想达成什么目的/u.test(sys), '任务定义已改写')
+    check('I7', '★ 提示词明说「模型只负责把这件事说成人话，风险由本地规则判」', /说成人话/u.test(sys) && /不要重判/u.test(sys), '职责边界写清楚')
     check('I8', '★ 反例「分步执行一段脚本」被明确列为不合格', /✗[^]*分步执行一段脚本/u.test(sys), '反例在提示词里')
-    check('I9', '★ 脚本规则：先整体意图，再分步意图', /整体意图/u.test(sys) && /分步意图/u.test(sys), '脚本处理规则已写入')
+    check('I9', '★ 脚本规则：先整体在干什么，再分步目的', /整体在干什么/u.test(sys) && /每一步.*为了什么/u.test(sys), '脚本处理规则已写入')
     check('I10', '★ 明确要求「不确定就说不确定」，禁止编造', /绝不允许编造/u.test(sys) && /无法确定/u.test(sys), '编造禁令 + 不确定文案')
-    check('I11', '★ 提示词点明「编造的意图比不写更危险」的理由', /编造的意图比不写更危险/u.test(sys), '给了模型拒绝编造的动机')
-    check('I12', '字段清单已从 what/background 换成 intent', /intent, touch, mode/u.test(sys) && !/what, touch, mode/u.test(sys), 'JSON 字段名已更新')
-    check('I13', 'parts 的措辞从「逐段解释」变成「每步的目的」', /每一步.*为了什么|每一步的目的/u.test(sys), '分步意图')
+    check('I11', '★ 提示词点明「编造的理由比不写更危险」', /编造的理由比不写更危险/u.test(sys), '给了模型拒绝编造的动机')
+    check('I12', '★ JSON 字段清单已是 v0.7.0 的五字段（title/why/touch/outcome/parts）', /title, why, touch, outcome, parts/u.test(sys) && !/"risk"/u.test(sys), '字段名已更新，且模型不再输出 risk')
+    check('I13', 'parts 的措辞是「每一步为了什么」', /每一步.*为了什么/u.test(sys), '分步目的')
   }
 
   // ---- 用户提示词也跟着改 ----
   {
     const withCtx = buildUserPrompt({ command: 'x', context: { available: true, block: '用户最近的指令：(1) 帮我补模型' } })
     const noCtx = buildUserPrompt({ command: 'x', context: { available: false, block: '' } })
-    check('I14', '有上下文时要求据此推断 intent', withCtx.includes('帮我补模型') && withCtx.includes('intent'), '指向 intent')
-    check('I15', '无上下文时要求 intent 原样写兜底句', noCtx.includes('未读取到会话上下文') && noCtx.includes('intent 必须原样写'), '兜底句指向 intent')
+    check('I14', '★ 有上下文时要求据此推断 title 与 why', withCtx.includes('帮我补模型') && withCtx.includes('title') && withCtx.includes('why'), '指向 title/why')
+    check('I15', '无上下文时要求 why 原样写兜底句', noCtx.includes('未读取到会话上下文') && noCtx.includes('why 必须原样写'), '兜底句指向 why')
     const seg = buildUserPrompt({ command: 'x', rules: { segments: { kind: 'pipe', segments: [{ label: '第 1 段', text: 'ls' }] } } })
-    check('I16', '分段脚本时提示「整体意图 + 每步目的」', seg.includes('整体意图') && seg.includes('每一步的目的'), '脚本规则进提示')
+    check('I16', '分段脚本时提示「整体在干什么 + 每步为了什么」', seg.includes('整体在干什么') && seg.includes('每一步'), '脚本规则进提示')
   }
 
   // ---- 空值兜底：真实 Ollama 吐过空 touch ----
@@ -3234,7 +3235,9 @@ group('附加（v0.5.6）：上下文断链修复 + AI 自述优先 + 两种兜�
   {
     const srcP = readFileSync(join(HERE_SRC, 'src', 'plugin.js'), 'utf8')
     const srcS = readFileSync(join(HERE_SRC, 'src', 'server.js'), 'utf8')
-    check('Z3', '★ findPendingByCallId 用 key 的 :callId 后缀精确匹配', /endsWith\(want\)/u.test(srcP), '后缀匹配而非模糊查找')
+    // v0.7.0：实现从「单个 want 变量」改成「candidates 集合」，但**精确后缀匹配这条红线不变** ——
+    // 必须是 endsWith(':' + 候选)，不能退化成 includes/模糊查找（会误配到别的挂起项）。
+    check('Z3', '★ findPendingByCallId 仍用 key 的 :callId 后缀精确匹配（非模糊查找）', /key\.endsWith\(':' \+ /u.test(srcP) && !/\.includes\(.*callId/u.test(srcP), '精确后缀匹配')
     check('Z4', '★ /translate 路由把 pending 里的 context 传给 translator', /pendingHit\?\.context/u.test(srcS), 'server.js 传入 context')
     check('Z5', '★ translate.served 日志会记录这次调用有没有上下文（下次好排查）', /contextSource/u.test(srcS), '可观测')
   }
@@ -3248,15 +3251,15 @@ group('附加（v0.5.6）：上下文断链修复 + AI 自述优先 + 两种兜�
       `"${NO_CONTEXT_NOTE}" vs "${NO_INTENT_NOTE}"`,
     )
     const srcT = readFileSync(join(HERE_SRC, 'src', 'translate.js'), 'utf8')
-    check('Z7', '★ mergeSections 里两句话各有触发条件，不会互相顶替', /merged\.intent = NO_CONTEXT_NOTE/u.test(srcT) && /merged\.intent = NO_INTENT_NOTE/u.test(srcT), '分流正确')
+    check('Z7', '★ mergeSections 里两句话各有触发条件，不会互相顶替（作用在 why 上）', /merged\.why = NO_CONTEXT_NOTE/u.test(srcT) && /merged\.why = NO_INTENT_NOTE/u.test(srcT), '分流正确')
   }
 
   /* ---------- 4. 提示词：AI 自述是首要依据 + 一致性检查 ---------- */
   {
     const sys = SYSTEM_PROMPT
-    check('Z8', '★ 提示词写明证据优先级，AI 的自述排第一', /证据有优先级/u.test(sys) && /AI 在发起这次审批前说过/u.test(sys), '优先级已写明')
-    check('Z9', '★ 提示词要求：AI 说明与命令行为不一致时如实写出落差', /对不上/u.test(sys) && /请留意/u.test(sys), '一致性检查规则')
-    check('Z10', '用户提示词里也强调「以 AI 自述为主线」', /以它为主线/u.test(buildUserPrompt({ command: 'x', context: { available: true, block: 'AI 在发起这次审批前说过：「x」' } })), 'buildUserPrompt 已强调')
+    check('Z8', '★ 提示词写明证据优先级，AI 的思考过程/自述排第一', /证据优先级/u.test(sys) && /AI 的思考过程/u.test(sys) && /AI 在发起这次审批前说过/u.test(sys), '优先级已写明')
+    check('Z9', '★ 提示词要求：AI 说明与命令行为不一致时如实写出落差', /对不上/u.test(sys) && /落差/u.test(sys), '一致性检查规则')
+    check('Z10', '用户提示词里也强调「以 AI 自述为主线」', /自述为主线/u.test(buildUserPrompt({ command: 'x', context: { available: true, block: 'AI 在发起这次审批前说过：「x」' } })), 'buildUserPrompt 已强调')
   }
 
   /* ---------- 5. extractContext 确实读了 AI 自述（数据源一直都在，问题只出在传递） ---------- */
@@ -3358,10 +3361,10 @@ group('附加（v0.5.8）：即时意图 / 用户主动要求 / 不重复调模�
   /* ---------- 4. 提示词：用户主动要求 ---------- */
   {
     const sys = SYSTEM_PROMPT
-    check('R9', '★ 提示词禁止把「第 N 次操作」当意图', /这一步是本回合的第 N 次操作/u.test(sys) && /不算意图/u.test(sys), '步骤计数不算意图')
+    check('R9', '★ 提示词禁止把「第 N 次操作」当意图', /第 N 次操作/u.test(sys) && /不算意图/u.test(sys), '步骤计数不算意图')
     check('R10', '★ 提示词要求意图体现「你刚才让它做 X」', /你刚才让它/u.test(sys), '主动要求要写出来')
-    check('R11', '★ 提示词要求收益写「按你的要求完成 X」', /按你的要求完成/u.test(sys), '收益跟着改')
-    check('R12', '★ 提示词明确「用户主动要求不得降低风险」', /绝不允许因此改变 risk/u.test(sys), '风险与意图解耦')
+    check('R11', '★ 提示词要求用户主动要求的事要在标题里体现「你刚才让它…」', /用户主动要求/u.test(sys) && /你刚才让它/u.test(sys), 'title 跟着改')
+    check('R12', '★ 提示词明确「用户主动要求不得降低风险」', /不要因为.*用户要的.*就说它安全/u.test(sys), '风险与措辞解耦')
   }
 
   /* ---------- 5. 意图不得洗白危险操作（用户主动要求 vs 风险等级） ---------- */
@@ -3777,12 +3780,16 @@ group('附加（v0.6.2）：可读性 —— 三行决策 / 路径折叠 / 危�
     check('Q13', '★ 等长替换保证下标对齐（高亮标的是原文里的真 curl，不是错位）', net != null && probe.slice(net.start, net.end).toLowerCase() === 'curl', net ? probe.slice(net.start, net.end) : 'null')
   }
 
-  /* ---------- 4. 意图长度：顶行不能被撑爆 ---------- */
+  /* ---------- 4. 长度上限：顶行和折叠区都不能被撑爆 ---------- */
   {
     const s = normalizeSections({ intent: 'x'.repeat(200), risk: '安全' })
-    check('Q14', '★ 超长意图被硬截断（顶行不会失控）', s.intent.length === 60, `长度=${s.intent.length}`)
+    // v0.7.0：顶行是 title（老模型吐的 intent 也会落进 title），硬上限 60
+    check('Q14', '★ 超长标题被硬截断（顶行不会失控）', s.title.length === 60, `长度=${s.title.length}`)
+    // 折叠区里的 why 同样要有上限，否则点开就把原始命令挤出视口
+    const s2 = normalizeSections({ title: '标题', why: 'y'.repeat(500), risk: '安全' })
+    check('Q14b', '★ 超长「为什么」也被硬截断（折叠区不会失控）', s2.why.length === 120, `长度=${s2.why.length}`)
     const src = readFileSync(join(HERE_SRC, 'src', 'prompt.js'), 'utf8')
-    check('Q15', '★ 提示词已把意图上限从 60 收紧到 34', /不超过 34 个汉字/u.test(src), '≤34 字')
+    check('Q15', '★ 提示词已把标题上限从 60 收紧到 34', /34 个汉字/u.test(src), '≤34 字')
   }
 
   /* ---------- 5. 客户端：三行决策 + 折叠，且原文一字不删 ---------- */
@@ -3807,6 +3814,275 @@ group('附加（v0.6.2）：可读性 —— 三行决策 / 路径折叠 / 危�
     check('Q23', '★ 源码顺序：pap_verdict 在 pap_more 之前（三行决策真的在最前）', iVerdict > 0 && iMore > 0 && iVerdict < iMore, `verdict@${iVerdict} more@${iMore}`)
   }
 }
+group('附加（v0.6.4）：作用域逃逸 —— tt 是局部变量，组件不能凭引用拿到')
+{
+  const srcScope = readFileSync(join(HERE_SRC, 'client.js'), 'utf8')
+
+  // 复现的真实 bug：DonateSlot 定义在 SettingsSection 外面，函数体里却写了
+  // tt('donateQrPending')。tt 是 SettingsSection 里的局部 const，运行时
+  // ReferenceError: tt is not defined → 设置页整体崩成「暂不可用（渲染异常）」，
+  // 同一 DOM 子树里排在它后面的爱发电链接也跟着消失。
+  check(
+    'S1',
+    '★ DonateSlot 显式接收 tt（不再凭空引用外层不存在的 tt）',
+    /function DonateSlot\(\{[^}]*\btt\b[^}]*\}\)/u.test(srcScope),
+    '函数签名必须解构出 tt',
+  )
+  check(
+    'S2',
+    '★ DonateSlot 的两处调用都把 tt 传了进去',
+    (srcScope.match(/h\(DonateSlot,\s*\{[^}]*\btt\b[^}]*\}\)/gu) || []).length === 2,
+    '微信 / 支付宝两个收款码位都要传',
+  )
+
+  // 通用防线：任何定义在 SettingsSection 外面的组件，内部都不该直接用 tt。
+  // 把所有顶层组件函数体抠出来，逐个查有没有裸 tt( 调用。
+  const offenders = []
+  const compRe = /\n    function ([A-Z][A-Za-z0-9_]*)\(([^)]*)\)\s*\{/gu
+  let m
+  while ((m = compRe.exec(srcScope)) !== null) {
+    const [, name, args] = m
+    if (/\btt\b/u.test(args)) continue // 自己声明了/接收了 tt 的不算
+    // 从函数体起点做括号配平，截出函数体
+    let i = srcScope.indexOf('{', m.index + m[0].length - 1)
+    if (i < 0) continue
+    let depth = 0
+    let end = i
+    for (let k = i; k < srcScope.length; k += 1) {
+      if (srcScope[k] === '{') depth += 1
+      else if (srcScope[k] === '}') {
+        depth -= 1
+        if (depth === 0) { end = k; break }
+      }
+    }
+    const body = srcScope.slice(i, end)
+    // tt 合法有三个来源：签名解构出来、函数体内自己声明（const tt = makeTT(props)）、
+    // 或者是从 props 现取的。这三种都不算逃逸；只有「三者都没有却在用」才是 bug。
+    const declaredInside = /\b(?:const|let|var)\s+tt\s*=/u.test(body)
+    if (!declaredInside && /\btt\s*\(/u.test(body)) offenders.push(name)
+  }
+  check(
+    'S3',
+    '★ 没有任何顶层组件凭空引用 tt（作用域逃逸防线）',
+    offenders.length === 0,
+    offenders.length ? offenders.join(', ') : '无',
+  )
+
+  check(
+    'S4',
+    '★ 渲染错误仍会上报（PluginBoundary 保留 stack/componentStack）',
+    /note\('render\.error'/u.test(srcScope) && /componentStack/u.test(srcScope),
+    '排障能力不能被重构删掉',
+  )
+  check(
+    'S5',
+    '★ 渲染错误上报的前端实现存在（client.js 调用 note）',
+    /note\('render\.error'/u.test(srcScope),
+    '必须有',
+  )
+}
+
+group('附加（v0.7.0）：上下文传递 —— callId 形态必须都能查到 pending')
+{
+  const srcPlugin = readFileSync(join(HERE_SRC, 'src', 'plugin.js'), 'utf8')
+  // 实测复现：客户端某些路径传的是 `hash:callId` 复合格式，
+  // 而 findPendingByCallId 只按 `':' + callId` 匹配后缀 → 匹配不上 →
+  // 上下文（连同 reasoning）整块丢失，卡片退回「未读取到会话上下文」。
+  check(
+    'CX1',
+    '★ findPendingByCallId 同时接受裸 callId 和 hash:callId 复合格式',
+    /lastIndexOf\(':'\)/u.test(srcPlugin) && /candidates/u.test(srcPlugin),
+    '要对原值和最后一段冒号后的部分各试一次',
+  )
+  check(
+    'CX2',
+    '★ /translate 端点确实把 pending 里的 context 传给翻译（浏览器没有 agent，只能靠它）',
+    /context:\s*pendingHit\?\.context/u.test(readFileSync(join(HERE_SRC, 'src', 'server.js'), 'utf8')),
+    'pending 是上下文的唯一来源',
+  )
+  const clientSrcV = readFileSync(join(HERE_SRC, 'client.js'), 'utf8')
+  // v0.7.0 回归：浮窗模式曾既没有风险等级也没有建议 ——
+  // 那是「不接管卡片」时用户的唯一信息来源。
+  check(
+    'CX3',
+    '★ 浮窗也渲染「风险 · 建议」这一行（不接管模式下依然能决策）',
+    /function PlainResult/u.test(clientSrcV) && /pap_verdictTitle[\s\S]{0,400}pap_verdictTop[\s\S]{0,300}pap_verdictAdvice/u.test(clientSrcV),
+    'PlainResult 里标题下面要有风险+建议',
+  )
+}
+
+group('附加（v0.7.2）：文案映射缺失不能把渲染打崩')
+{
+  const srcAdv = readFileSync(join(HERE_SRC, 'client.js'), 'utf8')
+  // 实测踩过的坑：zh 表里压根没有 advice 映射（risk 有），代码却写
+  // `tt('advice')[sections.advice]` → undefined[...] → TypeError，
+  // 后面的 `|| sections.advice` 兜底**根本来不及执行**。
+  // 它潜伏了很久，是因为这条分支只在接管模式的卡片里跑，而接管被槽位冲突卡住了。
+  check(
+    'CA1',
+    '★ 中文文案表里有 advice 映射（以前缺，卡片一接管就崩）',
+    /advice:\s*\{\s*可以允许/u.test(srcAdv),
+    'advice 映射必须存在',
+  )
+  check(
+    'CA2',
+    '★ 英文文案表里也有 advice 映射',
+    /advice:\s*\{\s*可以允许:\s*'Allow'/u.test(srcAdv),
+    '英文表对齐',
+  )
+  // 兜底不能只靠「表里有」——表被改坏时仍要能渲染
+  const rawAdvAccess = srcAdv.replace(/\/\*[\s\S]*?\*\//gu, '').replace(/^\s*\/\/.*$/gmu, '')
+  const unsafe = (rawAdvAccess.match(/tt\('[a-z]+'\)\[/gu) || []).filter((s) => !/tt\('[a-z]+'\) \|\|/.test(s))
+  check(
+    'CA3',
+    '★ 没有任何裸的 tt(key)[ 访问（全部带 || {} 兜底）',
+    unsafe.length === 0,
+    unsafe.length ? unsafe.join(', ') : '无裸访问',
+  )
+  check(
+    'CA4',
+    '★ 审批卡片与浮窗都渲染了「风险 · 建议」这一行',
+    (srcAdv.match(/pap_verdictAdvice/gu) || []).length >= 2
+      && /pap_verdictTitle[\s\S]{0,400}pap_verdictAdvice/u.test(srcAdv)
+      && /function PlainResult[\s\S]{0,1400}pap_verdictAdvice/u.test(srcAdv),
+    'ApprovalCard 与 PlainResult 各一处',
+  )
+}
+
+group('附加（v0.7.3）：手动选槽位模式必须写 conflictResolved')
+{
+  const src73 = readFileSync(join(HERE_SRC, 'client.js'), 'utf8')
+  const code73 = src73.replace(/\/\*[\s\S]*?\*\//gu, '').replace(/^\s*\/\/.*$/gmu, '')
+  // 实测卡死用户的坑：设置页那个下拉框以前是
+  //   onChange: (e) => patch((s) => (s.ui.slotMode = e.target.value))
+  // 只改 slotMode，**从不写 conflictResolved**；而 needsConflictChoice() 判的是
+  // conflictResolved !== true。于是「设置里选了接管」但插件仍然一直让位，
+  // 而且下拉框显示的就是「接管」，用户根本看不出哪里不对。
+  check(
+    'CS1',
+    '★ 设置页槽位模式下拉框走 applySlotMode（不再裸 patch slotMode）',
+    /onChange: \(e\) => applySlotMode\(e\.target\.value\)/u.test(code73)
+      && !/onChange: \(e\) => patch\(\(s\) => \(s\.ui\.slotMode/u.test(code73),
+    '两条路统一',
+  )
+  check(
+    'CS2',
+    '★ applySlotMode 同时写 conflictResolved: true',
+    /const applySlotMode = async \(mode\) => \{[\s\S]{0,400}conflictResolved: true/u.test(code73),
+    '手动选过 = 已解决冲突',
+  )
+  check(
+    'CS3',
+    '★ 重新点同一个选项也算显式确认（onClick 也走 applySlotMode）',
+    /onClick: \(\) => applySlotMode\(settings\.ui\.slotMode\)/u.test(code73),
+    '<select> 值不变时 onChange 不触发，onClick 兜住',
+  )
+  check(
+    'CS4',
+    '★ applySlotMode 定义在 SettingsSection 里（setSettings 只在那儿）',
+    /function SettingsSection[\s\S]{0,60000}const applySlotMode/u.test(code73),
+    '不能定义在 ApprovalCard 里',
+  )
+  // 老路（冲突提示按钮）本来就会写，不能被改坏
+  check(
+    'CS5',
+    '★ chooseSlotMode 仍然写 conflictResolved（冲突提示按钮那条路没被改坏）',
+    /function chooseSlotMode[\s\S]{0,300}conflictResolved: true/u.test(code73),
+    '两条路都要写',
+  )
+}
+
+group('附加（v0.7.4）：选过模式后不再显示黄色冲突警告')
+{
+  const src74 = readFileSync(join(HERE_SRC, 'client.js'), 'utf8')
+  const code74 = src74.replace(/\/\*[\s\S]*?\*\//gu, '').replace(/^\s*\/\/.*$/gmu, '')
+  // 显示层滞后：卡片早已接管（conflictResolved=true），设置页那条黄警告还挂着，
+  // 用户会以为「还没搞定」。
+  check(
+    'CR1',
+    '★ 黄色警告只在「有竞争者 且 还没选过模式」时显示',
+    /uiPrefs\.rivals\.length > 0 && uiPrefs\.conflictResolved !== true[\s\S]{0,200}pap_warnNote/u.test(code74),
+    '两个条件都要',
+  )
+  check(
+    'CR2',
+    '★ 已选过模式时改用中性说明（信息不丢，但不再制造「还没解决」的错觉）',
+    /sSlotRivalsDone/u.test(code74) && /uiPrefs\.conflictResolved !== true[\s\S]{0,300}sSlotRivalsDone/u.test(code74),
+    '降级为灰色 note',
+  )
+  check(
+    'CR3',
+    '★ 中英文文案都在',
+    /sSlotRivalsDone: '已按你选择的模式生效/u.test(src74) && /sSlotRivalsDone: 'Your choice is in effect/u.test(src74),
+    '双语对齐',
+  )
+}
+
+group('v0.7.5：并发合并 —— 同一个审批只打一次模型')
+{
+  // 实测 bug：宿主算 pending.full 和客户端自己发 /translate 在 t=0 同时出发，
+  // 缓存彼时都是空的，于是各打一次模型。端到端等的是慢的那个，token 还翻倍。
+  const mock = await startMockDeepSeek({ mode: 'ok' })
+  const env = harness({
+    rowConfig: baseConfig({
+      engine: 'deepseek',
+      deepseek: { baseUrl: mock.baseUrl, model: 'deepseek-chat', timeoutMs: 8000, retryOnRateLimit: false, askBeforeCall: false, apiKey: 'test-key' },
+    }),
+  })
+  // 必须用**两条不同命令**，否则第二次会命中缓存，测不到合并
+  const cmdA = 'ls -la /tmp/plain-approval-inflight-a'
+  const cmdB = 'ls -la /tmp/plain-approval-inflight-b'
+
+  const [a, b] = await Promise.all([
+    env.translator.translate({ command: cmdA, toolName: 'pwsh' }),
+    env.translator.translate({ command: cmdB, toolName: 'pwsh' }),
+  ])
+  const callsAfterPair = mock.state.calls
+  check(
+    'IF1',
+    '★ 不同命令并发时各打一次（不能把不同请求误合并）',
+    callsAfterPair === 2 && a.hash !== b.hash,
+    `接口调用 ${callsAfterPair} 次，hash ${a.hash?.slice(0, 8)} vs ${b.hash?.slice(0, 8)}`,
+  )
+
+  // 同一条命令并发两次 → 只应打一次模型
+  const mock2 = await startMockDeepSeek({ mode: 'ok' })
+  const env2 = harness({
+    rowConfig: baseConfig({
+      engine: 'deepseek',
+      deepseek: { baseUrl: mock2.baseUrl, model: 'deepseek-chat', timeoutMs: 8000, retryOnRateLimit: false, askBeforeCall: false, apiKey: 'test-key' },
+    }),
+  })
+  const same = 'ls -la /tmp/plain-approval-inflight-same'
+  const [c, d] = await Promise.all([
+    env2.translator.translate({ command: same, toolName: 'pwsh' }),
+    env2.translator.translate({ command: same, toolName: 'pwsh' }),
+  ])
+  check(
+    'IF2',
+    '★ 同一条命令并发两次 → 只打一次模型（合并生效）',
+    mock2.state.calls === 1,
+    `接口调用 ${mock2.state.calls} 次（期望 1）`,
+  )
+  check(
+    'IF3',
+    '★ 合并后两次拿到的结果一致，且都有可用 sections',
+    c?.hash === d?.hash && Boolean(c?.sections?.title) && Boolean(d?.sections?.title),
+    `hash ${c?.hash?.slice(0, 8)} / ${d?.hash?.slice(0, 8)}`,
+  )
+  // 合并结束后必须清干净，否则后来的请求会拿到一个早已完成的 Promise
+  const e = await env2.translator.translate({ command: same, toolName: 'pwsh' })
+  check(
+    'IF4',
+    '★ 合并的 Promise 用完即清（后来的请求仍走缓存而不是拿到旧 Promise）',
+    e.cached === true && mock2.state.calls === 1,
+    `再次请求 cached=${e.cached}，接口调用累计 ${mock2.state.calls}`,
+  )
+
+  env.cleanup(); await mock.close()
+  env2.cleanup(); await mock2.close()
+}
+
 group('结果汇总')
 const passed = results.filter((r) => r.ok).length
 const failed = results.filter((r) => !r.ok)

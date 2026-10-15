@@ -1,7 +1,7 @@
 {
   "name": "dsh-plain-approval",
-  "version": "0.6.3",
-  "description": "说人话 —— 让每一条提权命令，都先说人话。DSH 审批卡片「意图」解释插件。v0.6.2 可读性改造：决策信息三行置顶、次要信息按风险折叠、原始命令里的危险片段高亮（原文一字不删）、路径公共前缀折叠。",
+  "version": "0.7.5",
+  "description": "说人话 —— 让每一条提权命令，都先说人话。DSH 审批卡片「意图」解释插件。v0.7.0 卡片重构：标题置顶、风险与建议合并一行、细节全部折叠；风险判定改由本地规则给出（模型只负责说人话），提示词砍掉 55%、字段从 8 个减到 5 个；上下文新增 AI 思考过程（reasoning）并可一键关闭。",
   "type": "module",
   "license": "MIT",
   "author": "dsh-plain-approval contributors",

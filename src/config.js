@@ -110,7 +110,18 @@ export const DEFAULT_SETTINGS = {
     model: '',
     /** 'auto' | 'openai' | 'anthropic'；auto 按 baseUrl 是否以 /anthropic 结尾判断。 */
     apiStyle: 'auto',
-    timeoutMs: 15000,
+    /**
+     * v0.7.0：15000 → 8000。
+     *
+     * ⚠️ 这里**没有**照需求改成 5000，因为实测不支持：plain-approval.jsonl 里
+     * `translate.ok` 的中位耗时是 **10.4 秒**、p90 是 17.9 秒（188 个完整样本）。
+     * 设成 5 秒等于把绝大多数**本来能成功**的调用直接掐成超时，失败率会从
+     * 44.9% 涨到接近 100%，正好和 v0.7.0 降失败率的目标相反。
+     * 8000 是在「快速失败」和「别掐死成功请求」之间的折中：
+     * 配合 prompt 砍掉 55%、字段从 8 个减到 5 个，成功路径会明显变快，
+     * 这 8 秒更容易够用；而真超时的请求 8 秒就放手，用户看到的仍是本地规则版。
+     */
+    timeoutMs: 8000,
     /** 429 时指数退避重试一次。 */
     retryOnRateLimit: true,
     /** 单次翻译前询问（客户端弹小确认）。 */
@@ -170,6 +181,16 @@ export const DEFAULT_SETTINGS = {
     analysisDepth: 'l2',
     /** 是否允许在卡片上手动「升级到 L2」。 */
     allowUpgrade: true,
+    /**
+     * v0.7.0：是否把 AI 的**思考过程（reasoning）**也喂给翻译模型。
+     *
+     * 默认**开启**：这是本机读本机自己的 AI，用户最清楚自己的内容；
+     * 而且 reasoning 是意图推断最直接的证据 —— AI 嘴上只说「任务 2」，
+     * 推理里往往写着「因为用户说要 X，所以我先做 Y」。
+     *
+     * 关掉后 context.js 根本不读 `event.data.stream`，一个字都不取。
+     */
+    useReasoning: true,
 
     /**
      * 审批历史（v0.5.3）。
@@ -328,7 +349,7 @@ export function normalizeSettings(raw) {
       baseUrl: typeof merged.deepseek?.baseUrl === 'string' ? merged.deepseek.baseUrl.trim().replace(/\/+$/u, '') : '',
       model: typeof merged.deepseek?.model === 'string' ? merged.deepseek.model.trim() : '',
       apiStyle: ['auto', 'openai', 'anthropic'].includes(merged.deepseek?.apiStyle) ? merged.deepseek.apiStyle : 'auto',
-      timeoutMs: num(merged.deepseek?.timeoutMs, 15000, 1000, 180000),
+      timeoutMs: num(merged.deepseek?.timeoutMs, 8000, 1000, 180000),
       retryOnRateLimit: bool(merged.deepseek?.retryOnRateLimit, true),
       askBeforeCall: bool(merged.deepseek?.askBeforeCall, false),
     },
@@ -349,6 +370,9 @@ export function normalizeSettings(raw) {
       // v0.6.1：缺省 / 脏值一律回落到 'l2'（最准的那档），不猜、不静默降级到 L1
       analysisDepth: ['auto', 'l1', 'l2'].includes(merged.ui?.analysisDepth) ? merged.ui.analysisDepth : 'l2',
       allowUpgrade: bool(merged.ui?.allowUpgrade, true),
+      // v0.7.0：思考过程开关。缺省 / 脏值都回落到「开」（用户定的默认）。
+      // 关掉是**彻底不读**，不是读了再过滤 —— 隐私边界要落在读取侧。
+      useReasoning: bool(merged.ui?.useReasoning, true),
       history: {
         enabled: bool(merged.ui?.history?.enabled, true),
         retentionDays: num(merged.ui?.history?.retentionDays, 90, 1, 3650),

@@ -68,9 +68,17 @@ window.__ModuleLoader__.load({
         ['收益', 'benefit'],
       ],
       risk: { 安全: '安全', 注意: '注意', 危险: '危险' },
-      // v0.5.5：原来的「背景 + 干什么」两段合并为「意图」。
-      'label.intent': '意图',
+      // ⚠️ advice 的映射表以前**根本不存在**，而代码里到处写 `tt('advice')[sections.advice]` ——
+      //   一旦渲染到就抛 TypeError（`undefined[...]`，后面的 `|| sections.advice` 兜底来不及生效）。
+      //   之前一直没炸，是因为这个分支只在**接管模式的卡片**里跑，而接管被槽位冲突卡住了。
+      advice: { 可以允许: '可以允许', 请先确认: '请先确认', 建议拒绝: '建议拒绝' },
+      // v0.7.0：七段压成「首屏标题 + 折叠三段」。
+      // 标题在首屏单独渲染（pap_verdictTitle），这里只管折叠区那三段标签。
+      'label.why': '为什么',
       'label.touch': '碰什么',
+      'label.outcome': '如果允许',
+      // 旧字段标签保留：历史记录页和旧数据还会用到
+      'label.intent': '意图',
       'label.mode': '读还是写',
       'label.risk': '风险等级',
       'label.advice': '建议',
@@ -88,6 +96,11 @@ window.__ModuleLoader__.load({
       // v0.4.6-safe：拖动 / 复位功能已永久移除，位置由 CSS 固定，相关文案一并删除
       sInlineSummary: '在卡片内显示翻译摘要',
       sInlineSummaryHint: '默认关闭。开启后原生审批卡片顶部会多一行「说人话：…」，不想让卡片多这行就保持关闭。',
+      // v0.7.0：思考过程开关 + 隐私说明
+      sUseReasoning: '把 AI 的思考过程也用于判断意图',
+      sUseReasoningHint: '默认开启。AI 在发起这次审批前的推理过程（reasoning）会连同自述一起交给翻译模型，用来更准地判断「它到底想干什么」。这些都是你本机上的内容，只在你这台机器上跑，不外发；关掉后插件**根本不读取**思考过程，不只是不显示。',
+      sUseReasoningOn: '已开启：翻译时会参考 AI 的思考过程',
+      sUseReasoningOff: '已关闭：翻译时完全不读取 AI 的思考过程',
       chipOverlay: '当前是「浮窗模式」：{names} 负责审批卡片，说人话显示在右下角浮层。',
       grantForever: '长期同意',
       grantForeverHint: '只有「安全」等级的命令才能长期同意：命令完全一致才生效，限定当前工作区，可随时撤销。',
@@ -111,6 +124,8 @@ window.__ModuleLoader__.load({
       sAuditEmpty: '还没有自动放行记录。',
       // ---- v0.4 ----
       slotModeConflict: '当前是「接管模式」，但检测到 {names} 也在占用审批卡槽位。需要共存请切换到浮窗模式。',
+      // v0.7.4：用户已经明确选过模式后的中性说明（不再用黄色警告）。
+      sSlotRivalsDone: '已按你选择的模式生效（{mode}）。另有 {names} 也在占用审批卡槽位 —— 它们不会再让位；卡位不足时请改用浮窗模式。',
       slotModeTakeover: '当前是「接管模式」：审批卡片由说人话渲染，含完整说人话，不显示浮层。',
       slotModeOverlay: '当前是「浮窗模式」：不接管审批卡，说人话显示在右下角固定浮窗。',
       slotModeOff: '当前「完全关闭」：既不接管卡片，也不显示浮层。',
@@ -327,8 +342,12 @@ window.__ModuleLoader__.load({
         ['Benefit', 'benefit'],
       ],
       risk: { 安全: 'Safe', 注意: 'Caution', 危险: 'Danger' },
-      'label.intent': 'Intent',
+      // 与 zh 表对齐：advice 的映射以前也缺（见 zh 处注释）。
+      advice: { 可以允许: 'Allow', 请先确认: 'Confirm first', 建议拒绝: 'Suggest reject' },
+      'label.why': 'Why',
       'label.touch': 'What it touches',
+      'label.outcome': 'If allowed',
+      'label.intent': 'Intent',
       'label.mode': 'Read or write',
       'label.risk': 'Risk',
       'label.advice': 'Advice',
@@ -346,6 +365,11 @@ window.__ModuleLoader__.load({
       // v0.4.6-safe：拖动 / 复位功能已永久移除，位置由 CSS 固定，相关文案一并删除
       sInlineSummary: 'Show a translation summary inside the card',
       sInlineSummaryHint: 'Off by default. When on, the native approval card also shows a one-line "Plain: …" summary at the top.',
+      // v0.7.0: reasoning switch + privacy note
+      sUseReasoning: "Also use the AI's reasoning to judge intent",
+      sUseReasoningHint: "On by default. The AI's reasoning before it asked for approval is passed to the translation model alongside its own messages, so the intent is judged more accurately. This stays on your machine. When off, the plugin does not read the reasoning at all — it is not merely hidden.",
+      sUseReasoningOn: 'On: reasoning is used when translating',
+      sUseReasoningOff: 'Off: reasoning is never read',
       chipOverlay: 'Overlay mode: {names} owns the approval card; the plain translation shows in the bottom-right panel.',
       grantForever: 'Always allow',
       grantForeverHint: 'Only "safe" commands can be always-allowed: exact command match, current workspace only, revocable anytime.',
@@ -369,6 +393,8 @@ window.__ModuleLoader__.load({
       sAuditEmpty: 'No automatic allows yet.',
       // ---- v0.4 ----
       slotModeConflict: 'Takeover mode, but {names} also occupies the approval-card slot. Switch to overlay mode if you want both.',
+      // v0.7.4: neutral note shown after the user has already chosen a mode.
+      sSlotRivalsDone: 'Your choice is in effect ({mode}). {names} also occupy the approval-card slot — they will not yield; use overlay mode if the slot is contended.',
       slotModeTakeover: 'Currently TAKING OVER: the approval card is rendered by Plain Approval, with the full translation and no overlay.',
       slotModeOverlay: 'Currently OVERLAY: not taking over; the translation shows in the fixed bottom-right panel.',
       slotModeOff: 'Currently OFF: neither the card nor the overlay is shown.',
@@ -955,15 +981,18 @@ window.__ModuleLoader__.load({
       return tt('engineRule')
     }
 
-    /** 段落标签：中文优先，locale 座位可覆盖。「背景」在最前（v0.4 任务四）。 */
-    // v0.5.5：七段的第一段是「意图」（原「背景 + 干什么」合并而来）。
-    const SECTION_KEYS = ['intent', 'touch', 'mode', 'risk', 'advice', 'consequence', 'benefit']
+    /**
+     * 折叠区要显示的段落（v0.7.0）。
+     * 标题已在首屏、风险和建议也已合并进首屏，这里只剩「想细看才看」的三段：
+     * 为什么 / 碰什么（含读写）/ 如果允许（含后果与收益）。
+     * 旧的「读还是写」不再单独成段 —— 已在后端并进 touch 文案里。
+     */
+    const SECTION_KEYS = ['why', 'touch', 'outcome']
     function localizedSections(tt, sections) {
       const rows = []
       for (const key of SECTION_KEYS) {
-        // 意图可能为空（旧数据 / 模型没给），这时候不显示这一行，
-        // 而不是显示一句占位废话 —— 空着比废话好。
-        if (key === 'intent' && !(sections && sections.intent)) continue
+        // 模型可能没给某段（旧数据 / 解析降级），空着不显示 —— 空着比废话好。
+        if (!(sections && sections[key])) continue
         rows.push([tt('label.' + key), key])
       }
       return rows
@@ -1256,7 +1285,7 @@ window.__ModuleLoader__.load({
             { className: 'pap_strip' },
             h('span', { className: 'pap_dot' }),
             tt('waiting'),
-            sections ? h('span', { className: 'pap_badge ' + (colors.colors ? riskClass(sections.risk) : 'pap_riskPlain') }, tt('risk')[sections.risk] || sections.risk) : null,
+            sections ? h('span', { className: 'pap_badge ' + (colors.colors ? riskClass(sections.risk) : 'pap_riskPlain') }, (tt('risk') || {})[sections.risk] || sections.risk) : null,
             phase === 'loading' ? h('span', { className: 'pap_note' }, ' · ' + tt('translating')) : null,
           ),
           h(
@@ -1278,23 +1307,21 @@ window.__ModuleLoader__.load({
               ),
               !result && phase === 'loading' ? h('div', { className: 'pap_skeleton' }, tt('translating')) : null,
               headlineText ? h('div', { className: 'pap_headline pap_headlineWarn' }, headlineText) : null,
-              // ---- v0.6.2：三行决策 ----
-              // 用户点「允许」时只需要回答一个问题：**这条会不会毁我的东西**。
-              // 所以风险 + 建议 + 意图顶在最上面，其余按风险高低决定展开与否。
-              // 阅读成本与风险成正比：大多数命令是安全的 → 扫一眼就过；
-              // 危险的 → 一定被完整看到。这样「平均更快」与「关键时刻更谨慎」不冲突。
+              // ---- v0.7.0：第一屏 ----
+              // 用户心里的问题依次是：①发生了什么事 ②我需要担心吗 ③我该怎么做 ④想细看。
+              // 所以顺序固定为：标题（答①）→ 风险+建议（答②③，合并一行）→ 按钮。
+              // 「如果允许」和原始命令都挪进下面的折叠区，第一屏只留决策必需项。
               sections
                 ? h(
                     'div',
                     { className: 'pap_verdict' + (sections.risk === '危险' ? ' pap_verdictDanger' : '') },
+                    h('div', { className: 'pap_verdictTitle' }, String(sections.title || sections.intent || '')),
                     h(
                       'div',
                       { className: 'pap_verdictTop' },
-                      h('span', { className: 'pap_verdictRisk ' + (colors.colors ? riskClass(sections.risk) : 'pap_riskPlain') }, tt('risk')[sections.risk] || sections.risk),
-                      h('span', { className: 'pap_verdictAdvice' }, tt('advice')[sections.advice] || sections.advice),
+                      h('span', { className: 'pap_verdictRisk ' + (colors.colors ? riskClass(sections.risk) : 'pap_riskPlain') }, (tt('risk') || {})[sections.risk] || sections.risk),
+                      h('span', { className: 'pap_verdictAdvice' }, (tt('advice') || {})[sections.advice] || sections.advice),
                     ),
-                    h('div', { className: 'pap_verdictIntent' }, String(sections.intent || '')),
-                    sections.consequence ? h('div', { className: 'pap_verdictConsequence' }, String(sections.consequence)) : null,
                   )
                 : null,
               // ---- 次要信息：按风险决定是否默认展开 ----
@@ -1307,16 +1334,12 @@ window.__ModuleLoader__.load({
                       'div',
                       { className: 'pap_grid' },
                       localizedSections(tt, sections)
-                        .filter(([, key]) => key !== 'intent' && key !== 'advice')
+                        .filter(([, key]) => key !== 'title')
                         .map(([label, key]) =>
                           h(SectionRow, {
                             key,
                             label,
-                            value: h(
-                              'span',
-                              { className: key === 'risk' ? 'pap_risk ' + (colors.colors ? riskClass(sections.risk) : '') : undefined },
-                              key === 'risk' ? (tt('risk')[sections.risk] || sections.risk) : sections[key],
-                            ),
+                            value: h('span', null, sections[key]),
                           }),
                         ),
                     ),
@@ -1530,11 +1553,24 @@ window.__ModuleLoader__.load({
       static getDerivedStateFromError() {
         return { failed: true }
       }
-      componentDidCatch(error) {
+      componentDidCatch(error, info) {
         try {
           console.error('[plain-approval] 审批卡片渲染异常，已降级：', error)
         } catch (ignored) {
           /* 控制台不可用也无所谓 */
+        }
+        // 同 PluginBoundary：渲染异常必须落盘，否则事后无从查起。
+        try {
+          const stack = String((error && error.stack) || '')
+          note('render.error', {
+            boundaryText: 'approval-card',
+            errName: String((error && error.name) || ''),
+            errMessage: String((error && error.message) || ''),
+            stack,
+            componentStack: (info && info.componentStack) ? String(info.componentStack) : '',
+          })
+        } catch (ignored) {
+          /* 上报失败也绝不二次抛出 */
         }
       }
       render() {
@@ -1566,20 +1602,27 @@ window.__ModuleLoader__.load({
         'div',
         { className: 'pap_plain' + (stacked ? ' pap_plainWide' : '') },
         result.headline ? h('div', { className: 'pap_headline pap_headlineWarn' }, result.headline) : null,
+        // v0.7.0：浮窗也要有「标题 + 风险·建议」这一行。
+        // 之前只把它加在了审批卡片的 pap_verdict 里，结果浮窗模式
+        // （不接管卡片，只在右下角显示）**既没有风险等级也没有建议** ——
+        // 浮窗恰恰是「不接管」时用户的唯一信息来源，漏掉它等于把决策依据拿走了。
+        h('div', { className: 'pap_verdictTitle' }, String(sections.title || sections.intent || '')),
+        h(
+          'div',
+          { className: 'pap_verdictTop' },
+          h('span', { className: 'pap_verdictRisk ' + (colors?.colors ? riskClass(sections.risk) : 'pap_riskPlain') }, (tt('risk') || {})[sections.risk] || sections.risk),
+          h('span', { className: 'pap_verdictAdvice' }, (tt('advice') || {})[sections.advice] || sections.advice),
+        ),
         h(
           'div',
           { className: stacked ? 'pap_paper' : 'pap_grid' },
           localizedSections(tt, sections).map(([label, key]) => {
-            const shown = key === 'risk' ? tt('risk')[sections.risk] || sections.risk : sections[key]
-            const valueClass = key === 'risk'
-              ? 'pap_risk ' + (colors ? riskClass(sections.risk) : '')
-              : (key === 'background' ? 'pap_background' : undefined)
-            if (!stacked) return h(SectionRow, { key, label, value: h('span', { className: valueClass }, shown) })
+            if (!stacked) return h(SectionRow, { key, label, value: h('span', null, sections[key]) })
             return h(
               'div',
               { key, className: 'pap_paperRow' },
               h('div', { className: 'pap_paperLabel' }, label),
-              h('div', { className: 'pap_paperValue ' + (valueClass || '') }, shown),
+              h('div', { className: 'pap_paperValue' }, sections[key]),
             )
           }),
         ),
@@ -1849,11 +1892,28 @@ window.__ModuleLoader__.load({
       static getDerivedStateFromError() {
         return { failed: true }
       }
-      componentDidCatch(error) {
+      componentDidCatch(error, info) {
         try {
           console.error('[plain-approval] 渲染异常，已降级为安全占位：', error)
         } catch (ignored) {
           /* 忽略 */
+        }
+        // 诊断上报：渲染异常只进 console 的话，事后什么都查不到
+        // （DSH 的 renderer 日志不落盘），只能靠猜。这里走 note 端点写进
+        // plain-approval.jsonl，下次崩了直接看堆栈。
+        // 注意 sanitize 会把 `text` 键哈希化，所以边界文案改用 boundaryText。
+        try {
+          const stack = String((error && error.stack) || '')
+          note('render.error', {
+            boundaryText: String(this.props.text || ''),
+            boundarySilent: this.props.silent === true,
+            errName: String((error && error.name) || ''),
+            errMessage: String((error && error.message) || ''),
+            stack,
+            componentStack: (info && info.componentStack) ? String(info.componentStack) : '',
+          })
+        } catch (ignored) {
+          /* 上报失败也绝不二次抛出 */
         }
       }
       render() {
@@ -2595,7 +2655,11 @@ window.__ModuleLoader__.load({
       const loadGrants = async () => {
         try {
           const data = await api('grants')
-          if (alive.current) setGrantList(data)
+          // 在**源头**保证 items 一定是数组。渲染处有多处直接 `grantList.items.length`
+          // / `.map()`，只判了外层 grantList 没判内层 items —— 后端少给一个字段，
+          // 设置页就会在渲染期抛错、被 PluginBoundary 兜成「设置页暂不可用」，
+          // 连带捐款入口、分析深度、引擎选择**整页**都看不见。
+          if (alive.current) setGrantList({ ...data, items: Array.isArray(data?.items) ? data.items : [] })
         } catch (err) {
           if (alive.current) setError(err && err.message ? err.message : String(err))
         }
@@ -2625,7 +2689,9 @@ window.__ModuleLoader__.load({
       const loadAudit = async () => {
         try {
           const data = await api('audit')
-          if (alive.current) setAuditList(data)
+          // 同 loadGrants：渲染处直接 `auditList.entries.length` / `.slice()`，
+          // 这里在源头把 entries 钉成数组，杜绝同类崩溃。
+          if (alive.current) setAuditList({ ...data, entries: Array.isArray(data?.entries) ? data.entries : [] })
         } catch (err) {
           if (alive.current) setError(err && err.message ? err.message : String(err))
         }
@@ -2674,6 +2740,25 @@ window.__ModuleLoader__.load({
         } catch (err) {
           if (alive.current) setError(err && err.message ? err.message : String(err))
         }
+      }
+
+      /**
+       * v0.7.3：设置页的槽位模式选择器 —— 手动选过一次就必须记下来。
+       *
+       * 之前这个下拉框直接 patch `ui.slotMode`，**从不写 `conflictResolved`**，
+       * 而 `needsConflictChoice()` 判的是 `conflictResolved !== true`。
+       * 结果就是「设置里明明选了接管，实际仍然让位给原生卡片」，
+       * 用户还找不到原因 —— 因为下拉框显示的就是「接管」。
+       *
+       * 现在两条路统一，都会写 slotMode + conflictResolved：
+       *   · 设置页下拉框 → applySlotMode
+       *   · 审批时的冲突提示按钮 → chooseSlotMode（本来就写）
+       */
+      const applySlotMode = async (mode) => {
+        const next = ['takeover', 'overlay', 'off'].includes(mode) ? mode : 'takeover'
+        setSettings((prev) => ({ ...prev, ui: { ...(prev?.ui || {}), slotMode: next, conflictResolved: true } }))
+        uiPrefs.conflictResolved = true
+        await chooseSlotMode(next)
       }
 
       if (loading && !settings) {
@@ -3126,11 +3211,27 @@ window.__ModuleLoader__.load({
           h('div', { className: 'pap_note' }, tt('sSlotHint')),
           // v0.5.0-stable：只有三个固定选项，**没有 auto**。
           // 插件不做任何自动判定，是否接管完全由用户在这里显式选择。
+          //
+          // v0.7.3 修：这里以前是
+          //   onChange: (e) => patch((s) => (s.ui.slotMode = e.target.value))
+          // —— 只改 slotMode，**从不写 conflictResolved**。于是用户明明在设置页选了
+          // 「接管」，needsConflictChoice() 仍然为真，ComposerEntry 一直走让位分支，
+          // 卡片还是原生的。冲突提示 ConflictPrompt 里那个按钮走的是 chooseSlotMode
+          // （会写 conflictResolved），但设置页这个下拉框走的是另一条路，两边不一致。
+          // 现在两条路都走 applySlotMode（见上方定义）。
           h(Field, {
             label: '',
             children: h(
               'select',
-              { className: 'pap_input', value: settings.ui.slotMode, onChange: (e) => patch((s) => (s.ui.slotMode = e.target.value)) },
+              {
+                className: 'pap_input',
+                value: settings.ui.slotMode,
+                onChange: (e) => applySlotMode(e.target.value),
+                // ★ 重新点同一个选项也算一次显式确认。
+                // <select> 的 onChange 只在**值变化**时触发，用户当前已经是「接管」
+                // 再点一次不会有任何反应 —— 而「我就是要接管」这个意图必须被记下来。
+                onClick: () => applySlotMode(settings.ui.slotMode),
+              },
               h('option', { value: 'takeover' }, tt('sSlotTakeover')),
               h('option', { value: 'overlay' }, tt('sSlotOverlay')),
               h('option', { value: 'off' }, tt('sSlotOff')),
@@ -3142,9 +3243,19 @@ window.__ModuleLoader__.load({
             slotStateText(status, tt),
           ),
           // 冲突提示：只读扫描到的结果，仅展示，不驱动任何行为
-          uiPrefs.rivals.length > 0
+          //
+          // v0.7.4 修：以前只看 `rivals.length > 0`，**没看 conflictResolved**。
+          // 于是用户手动选过模式之后（conflictResolved=true，卡片已经接管了），
+          // 这条黄色警告还一直挂在设置页上 —— 典型���显示层滞后：
+          // 状态早就变了，提示没跟上，用户会以为还有问题没解决。
+          //
+          // 现在：已明确选过模式 → 不再显示黄色警告（问题已处理），
+          // 只留一行中性说明，信息不丢但不再制造「还没搞定」的错觉。
+          uiPrefs.rivals.length > 0 && uiPrefs.conflictResolved !== true
             ? h('div', { className: 'pap_note pap_warnNote' }, interpolate(tt('sSlotRivals'), { names: uiPrefs.rivals.join('、'), mode: settings.ui.slotMode }))
-            : null,
+            : uiPrefs.rivals.length > 0
+              ? h('div', { className: 'pap_note' }, interpolate(tt('sSlotRivalsDone'), { names: uiPrefs.rivals.join('、'), mode: settings.ui.slotMode }))
+              : null,
           h(Field, {
             label: tt('sCaretakers'),
             hint: tt('sCaretakersHint'),
@@ -3163,6 +3274,14 @@ window.__ModuleLoader__.load({
             onChange: (v) => patch((s) => (s.ui.showInlineSummary = v)),
           }),
           h('div', { className: 'pap_note' }, tt('sInlineSummaryHint')),
+          // v0.7.0：思考过程开关（默认开）+ 隐私说明
+          h(Check, {
+            label: tt('sUseReasoning'),
+            checked: settings.ui.useReasoning !== false,
+            onChange: (v) => patch((s) => (s.ui.useReasoning = v)),
+          }),
+          h('div', { className: 'pap_note' }, tt('sUseReasoningHint')),
+          h('div', { className: 'pap_note' }, tt(settings.ui.useReasoning !== false ? 'sUseReasoningOn' : 'sUseReasoningOff')),
         ),
 
         h(
@@ -3310,8 +3429,8 @@ window.__ModuleLoader__.load({
                     h(
                       'div',
                       { className: 'pap_donateGrid' },
-                      h(DonateSlot, { label: tt('donateWechat') }),
-                      h(DonateSlot, { label: tt('donateAlipay') }),
+                      h(DonateSlot, { label: tt('donateWechat'), tt }),
+                      h(DonateSlot, { label: tt('donateAlipay'), tt }),
                       h(
                         'a',
                         { className: 'pap_donateLink', href: tt('donateAfdianUrl'), target: '_blank', rel: 'noreferrer noopener' },
@@ -3341,11 +3460,17 @@ window.__ModuleLoader__.load({
      * 现在是一个灰色方块 + 「收款码待填」。用户后续把真实二维码放进
      * assets/ 并把下面的占位换成 <img src={API + 'asset/xxx.png'} /> 即可，结构不用动。
      */
-    function DonateSlot({ label }) {
+    function DonateSlot({ label, tt }) {
+      // ⚠️ tt 必须由调用方传入：DonateSlot 定义在 SettingsSection **外面**，
+      //   而 tt 是 SettingsSection 里的局部 const（makeTT(props)）。
+      //   v0.6.3 之前这里直接写 tt('donateQrPending') → ReferenceError: tt is not defined
+      //   → 设置页整体崩成「暂不可用（渲染异常）」，连同一层的爱发电链接也一起消失
+      //   （DonateSlot 排在它前面，先抛错，整个子树都不渲染）。
+      const text = typeof tt === 'function' ? tt('donateQrPending') : '收款码待填'
       return h(
         'div',
         { className: 'pap_donateSlot' },
-        h('div', { className: 'pap_donateQr', role: 'img', 'aria-label': label }, h('span', null, tt('donateQrPending'))),
+        h('div', { className: 'pap_donateQr', role: 'img', 'aria-label': label }, h('span', null, text)),
         h('div', { className: 'pap_donateSlotLabel' }, label),
       )
     }
@@ -3437,6 +3562,9 @@ window.__ModuleLoader__.load({
       // ---- v0.6.2：三行决策 + 折叠 + 高亮 ----
       '.pap_verdict{border:1px solid var(--dsw-alias-border-secondary,rgba(127,127,127,.22));border-radius:8px;padding:10px 12px;margin-bottom:10px;background:var(--dsw-alias-bg-secondary,rgba(127,127,127,.05))}',
       '.pap_verdictDanger{border-color:var(--dsw-alias-state-error-primary,#d92d20);background:rgba(217,45,32,.06)}',
+      // v0.7.0：标题是卡片第一行，字号最大、颜色最重。
+      // 颜色一律走 --dsw-alias-* 变量：DSH 换主题时会跟着换，深浅色都不会糊。
+      '.pap_verdictTitle{font-size:15px;font-weight:600;line-height:22px;color:var(--dsw-alias-label-primary);margin-bottom:6px;word-break:break-word}',
       '.pap_verdictTop{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:4px}',
       '.pap_verdictRisk{font-size:15px;font-weight:700;line-height:22px}',
       '.pap_verdictAdvice{font-size:13px;font-weight:600;line-height:20px;color:var(--dsw-alias-label-secondary)}',

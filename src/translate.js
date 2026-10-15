@@ -145,8 +145,13 @@ export function createTranslator(deps) {
 
   function buildRuleOnly(input, rules, status, extra = {}) {
     const intent = extra.intent ?? (input.context && input.context.available ? fallbackIntent(input.context) : NO_CONTEXT_NOTE)
+    // v0.7.0：纯本地路径**不调模型**就能给出完整卡片结构。
+    // title 来自 ruleSummary（本地模板，0ms），why 用上下文兜底文案，
+    // touch 带上读写，outcome 把后果和收益合成一句。
+    const title = clampChars(ruleSummary(input.command, rules, input.toolName), 60)
+    const outcome = asSentence(rules.consequence)
     return {
-      v: 1,
+      v: 2,
       status,
       engine: null,
       engineLabel: null,
@@ -157,13 +162,24 @@ export function createTranslator(deps) {
       cached: false,
       intent,
       sections: {
-        intent,
-        what: clampChars(ruleSummary(input.command, rules, input.toolName), 40),
-        touch: rules.touch,
-        mode: rules.mode,
+        // ---- v0.7.0 新结构 ----
+        title,
+        why: intent,
+        // 「读还是写」不再单独成段，并进 touch（用户要求）
+        touch: rules.touch ? `${rules.touch}（${rules.mode}）` : `未能识别具体对象（${rules.mode}）`,
+        outcome,
         risk: rules.risk,
         advice: rules.advice,
-        consequence: asSentence(rules.consequence),
+        mode: rules.mode,
+        // ---- 兼容旧字段 ----
+        // what 是 v0.7.0 之前「在干什么」的字段名，和 title 同源。
+        // 删掉它会让读到旧结构的调用方（历史记录页、旧客户端、测试）直接崩 ——
+        // 教训：换字段名时别名要一起留着，删除要等一个大版本之后再做。
+        intent,
+        what: title,
+        consequence: outcome,
+        // 收益在界面上已并进 outcome，但旧字段不能置空 ——
+        // 老客户端和测试都还在读它，空串是 falsy，会被当成「这段没有」。
         benefit: asSentence(rules.benefit),
         parts: rules.segments.kind === 'single'
           ? []
@@ -185,50 +201,74 @@ export function createTranslator(deps) {
     }
   }
 
-  /** 用规则结果「加固」模型结果：规则能证明的结论优先。 */
-  function mergeSections(llmSections, rules, intent, forceIntent = false) {
+  /**
+   * 用规则结果「加固」模型结果：规则能证明的结论优先。
+   * @param {object} llmSections - 模型输出（已 normalize）
+   * @param {object} rules - 本地规则
+   * @param {string} intent - 上下文兜底的意图/理由文案
+   * @param {boolean} forceIntent - 读不到上下文时强制用「未读取到会话上下文」
+   * @param {string} [command] - 原始命令（本地模板标题用）
+   * @param {string} [toolName] - 工具名
+   */
+  function mergeSections(llmSections, rules, intent, forceIntent = false, command = '', toolName = '') {
     const merged = { ...llmSections }
     const overrides = rules.overrides || {}
     if (overrides.force) {
       if (overrides.risk) merged.risk = overrides.risk
       if (overrides.advice) merged.advice = overrides.advice
-      if (overrides.consequence) merged.consequence = asSentence(overrides.consequence)
+      if (overrides.consequence) merged.outcome = asSentence(overrides.consequence)
     }
     if (rules.risk === '危险') {
       merged.risk = '危险'
       merged.advice = '建议拒绝'
-      merged.consequence = asSentence(rules.consequence)
+      merged.outcome = asSentence(rules.consequence)
       if (rules.mode === '删除' || rules.mode === '混合') merged.mode = rules.mode
     } else if (!overrides.force && rules.risk === '注意' && llmSections.risk === '安全') {
       merged.risk = '注意'
       merged.advice = '请先确认'
-      if (!merged.consequence || merged.consequence.length < 4) merged.consequence = asSentence(rules.consequence)
+      if (!merged.outcome || merged.outcome.length < 4) merged.outcome = asSentence(rules.consequence)
     }
     if (rules.segments.kind !== 'single' && (!merged.parts || merged.parts.length === 0)) {
       merged.parts = rules.segments.segments.map((s) => ({ label: s.label, text: oneLine(s.text, 120) }))
     }
-    // 「意图」由上下文决定（v0.5.5 起取代原来的「背景」）：
-    //  - 读不到上下文时**强制**用「未读取到会话上下文」—— 这是「信息缺失」；
-    //  - 读到了上下文、但模型没给出可用意图时，用上下文兜底文案；
-    //    连兜底文案都给不出，才写「已读取到但无法确定意图」—— 这是「模型无能」。
-    // 两者必须分开：用户需要知道自己在看的是哪一种。
+    // v0.7.0：title / why 的兜底链。
+    //  - title 是卡片顶行，模型给不出就用本地模板（ruleSummary，0ms）；
+    //  - why 在读不到上下文时**强制**用「未读取到会话上下文」—— 这是「信息缺失」；
+    //    读到了上下文、但模型没给出可用理由时用上下文兜底；都没有才写「无法确定」—— 这是「模型无能」。
+    // 两者必须分开：用户需要知道自己看的是哪一种。
     //
-    // ⚠️ 这里**只管意图文案，不碰 risk/advice/consequence**。
-    //    意图是模型对「对方想干什么」的推测，风险是本地规则的判定 ——
-    //    两者必须解耦，否则一段听起来合理的意图就能把危险操作洗成安全。
-    const modelIntent = oneLine(merged.intent ?? '', 120)
-    const fallbackFromContext = oneLine(intent ?? '', 120)
+    // ⚠️ 这里**只管文案，不碰 risk/advice/outcome**。
+    //    理由是模型对「对方想干什么」的推测，风险是本地规则的判定 ——
+    //    两者解耦，否则一段听起来合理的理由就能把危险操作洗成安全。
+    if (!merged.title || /^(执行一条命令|执行|.*未能判断.*)$/u.test(String(merged.title))) {
+      merged.title = clampChars(ruleSummary(command, rules, toolName), 60)
+    }
+    const modelWhy = oneLine(merged.why ?? '', 160)
+    const fallbackFromContext = oneLine(intent ?? '', 160)
     const hasContextFallback = fallbackFromContext !== '' && !/未读取到会话上下文|no session context/iu.test(fallbackFromContext)
     if (forceIntent) {
-      merged.intent = NO_CONTEXT_NOTE
-    } else if (hasContextFallback && (modelIntent === '' || /未读取到会话上下文|no session context/iu.test(modelIntent))) {
-      merged.intent = clampChars(fallbackFromContext, 60)
-    } else if (modelIntent === '' || /未读取到会话上下文|no session context/iu.test(modelIntent)) {
-      merged.intent = NO_INTENT_NOTE
+      merged.why = NO_CONTEXT_NOTE
+    } else if (hasContextFallback && (modelWhy === '' || /未读取到会话上下文|no session context/iu.test(modelWhy))) {
+      merged.why = clampChars(fallbackFromContext, 80)
+    } else if (modelWhy === '' || /未读取到会话上下文|no session context/iu.test(modelWhy)) {
+      merged.why = NO_INTENT_NOTE
     } else {
-      merged.intent = clampChars(modelIntent, 60)
+      merged.why = modelWhy
     }
-    // 兜底：模型没给 parts 时，至少把分段原文列出来（由调用方填）
+    // touch 带上读写（v0.7.0：「读还是写」不再单独成段）
+    if (merged.mode && !/\(|（/.test(String(merged.touch ?? ''))) {
+      merged.touch = `${merged.touch}（${merged.mode}）`
+    }
+    // 同步旧字段，保证「一键复制」、英文渲染、历史记录页和旧客户端都不断。
+    //
+    // ⚠️ intent 必须接 **why**，不能接 title —— intent 的历史语义是「AI 想干什么、
+    // 为什么干」，对应的是新结构的 why；而「读不到上下文时强制写兜底句」这条规则
+    // 正是作用在它上面（v0.5.5 起）。如果让 intent = title，这套兜底就形同虚设：
+    // 模型给什么标题，意图就变成什么，兜底句再也出不来。
+    // what 才是「在干什么」的旧名，对应 title。
+    merged.intent = merged.why
+    merged.what = merged.title
+    merged.consequence = merged.outcome
     return merged
   }
 
@@ -453,6 +493,18 @@ export function createTranslator(deps) {
     return { ok: false, code: 'unknown-channel', reason: '未知通道 ' + channel }
   }
 
+  /**
+   * v0.7.5：正在飞行中的翻译，key → Promise。
+   *
+   * 存在的唯一理由：同一个审批会被发起两次翻译（宿主算 pending.full +
+   * 客户端发现 full 还是 null 就自己发一次），两次在 t=0 同时出发，
+   * 缓存彼时都是空的，于是各打一次模型 —— 端到端等的是慢的那个，
+   * token 还翻倍。详见 translate() 里那段注释。
+   *
+   * 用法：同 cacheKey 的后来者直接拿同一个 Promise 等结果，不重复打模型。
+   */
+  const inFlight = new Map()
+
   /* ---------------------------------------------------------------- */
   /* 主入口                                                            */
   /* ---------------------------------------------------------------- */
@@ -464,7 +516,8 @@ export function createTranslator(deps) {
     const truncated = truncateCommand(rawCommand, 4000)
     const context = input?.context && typeof input.context === 'object' && input.context.available !== undefined
       ? input.context
-      : extractContext(input?.agent, input?.callId)
+      // v0.7.0：useReasoning 关掉时，extractContext 压根不去读 event.data.stream。
+      : extractContext(input?.agent, input?.callId, { useReasoning: s.ui.useReasoning !== false })
     const normalized = {
       command: truncated.text,
       originalLength: truncated.originalLength,
@@ -542,6 +595,32 @@ export function createTranslator(deps) {
       }
     }
 
+    // ================================================================
+    // v0.7.5：并发合并（in-flight de-duplication）
+    //
+    // 实测问题：同一个审批会被发起**两次**翻译 ——
+    //   ① 宿主在审批监听器里异步算 pending.full；
+    //   ② 客户端发现 pending.full 还是 null，立刻自己发 /translate（client.js:1147）。
+    // 两者在 t=0 同时出发，缓存彼时都还是空的，于是**各打一次模型**。
+    // 实测（call_00_d84xbOXk9qHGCju6uUht1178）：
+    //   translate.ok      ms=3700   ← 宿主那次，先完成
+    //   translate.served  ms=6559   ← 客户端那次，更慢（大概率被服务端排队压后）
+    // 端到端等的是**慢的那个**，第一次的结果被完全浪费，token 也翻倍。
+    //
+    // 现在：相同 cacheKey 的并发请求复用同一个 Promise，后来者等结果，不再打模型。
+    // 预期：端到端 6.59s → 约 3.8s，模型调用次数 2 → 1，token 成本减半。
+    //
+    // 为什么合并点放在**缓存查询之后**：缓存命中是 1ms 的事，不该排队等别人。
+    // 放在这里也意味着 L1 短路（纯本地 0ms）保持原样，不受合并影响。
+    // ================================================================
+    const joined = inFlight.get(key)
+    if (joined) {
+      logger?.info('translate.joined', { hash: shortHash(normalized.command), ms: Date.now() - started })
+      return joined
+    }
+
+    const task = (async () => {
+
     const device = await deviceInfo(false)
     const tier = device?.tier ?? 'unknown'
 
@@ -608,29 +687,34 @@ export function createTranslator(deps) {
       return result
     }
 
-    const parsed = parseSevenSection(engineResult.text)
+    // v0.7.0：把本地规则结论一起交给 parse —— 模型不再判风险，判定权在这里。
+    const parsed = parseSevenSection(engineResult.text, {
+      risk: rules.risk, advice: rules.advice, mode: rules.mode, benefit: rules.benefit,
+    })
     const contextAvailable = context?.available === true
     const intent = contextAvailable ? fallbackIntent(context) : NO_CONTEXT_NOTE
     let sections
     let formatWarning = null
     if (parsed.ok) {
-      sections = mergeSections(parsed.value, rules, intent, !contextAvailable)
+      sections = mergeSections(parsed.value, rules, intent, !contextAvailable, normalized.command, normalized.toolName)
     } else {
       formatWarning = { kind: parsed.reason, raw: oneLine(parsed.raw, 600) }
       sections = mergeSections(
         {
-          what: clampChars(ruleSummary(normalized.command, rules, normalized.toolName), 40),
+          title: clampChars(ruleSummary(normalized.command, rules, normalized.toolName), 60),
           touch: rules.touch,
           mode: rules.mode,
           risk: rules.risk,
           advice: rules.advice,
-          consequence: asSentence(rules.consequence),
+          outcome: asSentence(rules.consequence),
           benefit: asSentence(rules.benefit),
           parts: [],
         },
         rules,
         intent,
         !contextAvailable,
+        normalized.command,
+        normalized.toolName,
       )
       logger?.failure({ command: normalized.command, engine: engineResult.engine, code: 'format-invalid', message: parsed.reason, ms: engineResult.ms })
     }
@@ -707,6 +791,16 @@ export function createTranslator(deps) {
       context: context?.available ? 'yes' : 'no',
     })
     return result
+
+    })()   // ← v0.7.5：闭合 in-flight 合并用的 IIFE
+
+    inFlight.set(key, task)
+    try {
+      return await task
+    } finally {
+      // 只删自己放进去的那个：万一 key 上换过别的任务，别误删
+      if (inFlight.get(key) === task) inFlight.delete(key)
+    }
   }
 
   /** 缓存身份：引擎策略 + 模型身份，切引擎/换模型都不命中旧缓存。 */
@@ -721,7 +815,7 @@ export function createTranslator(deps) {
   function ruleOnly(input) {
     const s = settings()
     const truncated = truncateCommand(String(input?.command ?? ''), 4000)
-    const context = input?.context ?? extractContext(input?.agent, input?.callId)
+    const context = input?.context ?? extractContext(input?.agent, input?.callId, { useReasoning: s.ui.useReasoning !== false })
     const normalized = {
       command: truncated.text,
       originalLength: truncated.originalLength,

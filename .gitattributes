@@ -1,2 +1,13 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# 强制 LF。
+# 原来的 `* text=auto` 挡不住 checkout：本仓库 core.autocrlf=true，
+# git 检出时会把工作区文件转成 CRLF（client.js 一度变成 3749 处 CRLF）。
+# `eol=lf` 是显式约束：仓库内存 LF，检出到工作区也强制 LF。
+* text=auto eol=lf
+
+# 二进制：禁止任何行尾转换。
+*.tgz binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary

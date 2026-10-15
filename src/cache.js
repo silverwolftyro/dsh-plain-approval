@@ -14,7 +14,10 @@ import { sha256, safeParse } from './util.js'
 
 const require = createRequire(import.meta.url)
 
-export const CACHE_VERSION = 2
+// v0.7.0：缓存里存的是 v=1 的七段结构，键里带上 v=2 的结果结构。
+// 递增后旧条目自动失效 —— 就算解析层能兼容旧字段，也不要让用户
+// 第一次打开就看到「卡片结构还是老的」而误以为没升级。
+export const CACHE_VERSION = 3
 
 /**
  * 缓存 key：命令 + 引擎通道 + 模型身份 + **上下文指纹**，四者任一变化都不命中。

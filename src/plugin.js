@@ -327,17 +327,25 @@ export function apply(ctx, rowConfig = {}) {
    * v0.5.6 修：客户端请求 /translate 时**拿不到上下文** —— 那次调用发生在浏览器里，
    * 没有 agent，只能 extractContext(undefined, callId) → 空 → 意图被强制写成
    * 「未读取到会话上下文」。而宿主在审批监听器里明明读到了（approval.seen 的 context=yes）。
-   * 两边对不上，用户看到的就是「日志说有上下文，卡片却说没有」。
    *
-   * 现在把宿主读到的 context 挂在 pending 上，客户端带 callId 来取。
-   * 顺带好处：这次翻译的缓存指纹与宿主刚算好的那次一致，能直接命中，
-   * 同一条命令不必调两次模型。
+   * v0.7.0 修（实测复现）：上面那条只对**裸 callId** 生效。真机上抓到过
+   *   pendingFound=false 的一次，日志里 callId 是 `92d4aaf2...:call_00_qGfO99mC...` ——
+   *   客户端某些路径传的是**已经被拼上 hash 的复合形式**，再拼一次 ':' 自然匹配不上后缀，
+   *   上下文（连同 reasoning）就整块丢了，卡片退回「未读取到会话上下文」。
+   *
+   * 现在两种形态都能查到：对原值、以及它最后一段冒号后的部分，各试一次。
    */
   function findPendingByCallId(callId) {
     if (callId === undefined || callId === null || callId === '') return null
-    const want = ':' + String(callId)
+    const raw = String(callId)
+    const candidates = new Set([raw])
+    const tail = raw.includes(':') ? raw.slice(raw.lastIndexOf(':') + 1) : ''
+    if (tail && tail !== raw) candidates.add(tail)
     for (const entry of pending.values()) {
-      if (String(entry?.key ?? '').endsWith(want)) return entry
+      const key = String(entry?.key ?? '')
+      for (const c of candidates) {
+        if (c !== '' && key.endsWith(':' + c)) return entry
+      }
     }
     return null
   }
